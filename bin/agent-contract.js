@@ -4,10 +4,12 @@
 const path = require("path");
 const { init } = require("../lib/commands/init");
 const { detect } = require("../lib/commands/detect");
+const { run } = require("../lib/commands/run");
 
 const COMMANDS = {
   init,
   detect,
+  run,
 };
 
 function printHelp() {
@@ -21,13 +23,41 @@ function printHelp() {
       "Commands:",
       "  init      Install the .agent/ contract into the current repo (idempotent)",
       "  detect    Run stack detection only; print result to stdout (no writes)",
+      "  run       Run a role against a task via the configured provider",
       "",
-      "Flags:",
+      "Flags (all commands):",
       "  --cwd <path>     Run against the given directory (default: process.cwd())",
-      "  --yes, -y        Accept all defaults; do not prompt",
-      "  --dry-run        Show what would change without writing",
-      "  --force          Overwrite existing files (default: merge/skip)",
+      "  --dry-run        Show what would happen without writing or calling a provider",
       "  --help, -h       Show this message",
+      "",
+      "Flags (init):",
+      "  --yes, -y        Accept all defaults; skip the preset prompt",
+      "  --force          Overwrite existing files (default: merge/skip)",
+      "  --preset <name>  Apply a conventions preset without prompting:",
+      "                     oop-strict | functional-pragmatic |",
+      "                     nestjs-clean-architecture | laravel-service-pattern | none",
+      "  --learn          After init, sample existing source files and write a draft",
+      "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
+      "                   Nothing is auto-applied — the draft is yours to edit and merge.",
+      "",
+      "Flags (run):",
+      "  --role <name>    Role to activate: generator | integrator | tester | debugger | documenter",
+      "  --task <text>    Task description (used when --spec is not provided)",
+      "  --spec <file>    Path to a JSON task spec (required fields per role)",
+      "  --provider <p>   Override provider (see below)",
+      "",
+      "Providers (auto-detected in order if --provider is not set):",
+      "  anthropic    Calls api.anthropic.com — requires ANTHROPIC_API_KEY",
+      "  openai       Calls api.openai.com   — requires OPENAI_API_KEY",
+      "  claude-code  Uses your Claude Pro/Max subscription via the installed `claude` CLI.",
+      "               No API key needed. Install Claude Code at claude.ai/code.",
+      "  echo         Dry-run: prints the assembled prompt, calls nothing.",
+      "",
+      "Environment variables (run):",
+      "  ANTHROPIC_API_KEY   Required for the anthropic provider",
+      "  OPENAI_API_KEY      Required for the openai provider",
+      "  AGENT_PROVIDER      Override provider (same as --provider)",
+      "  AGENT_MODEL         Override model ID (anthropic/openai only)",
       "",
     ].join("\n")
   );
@@ -71,6 +101,11 @@ function parseFlags(args) {
     else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "--force") flags.force = true;
     else if (a === "--cwd") flags.cwd = args[++i];
+    else if (a === "--role") flags.role = args[++i];
+    else if (a === "--task") flags.task = args[++i];
+    else if (a === "--spec") flags.spec = args[++i];
+    else if (a === "--provider") flags.provider = args[++i];
+    else if (a === "--preset") flags.preset = args[++i];
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
     else flags._.push(a);
   }
