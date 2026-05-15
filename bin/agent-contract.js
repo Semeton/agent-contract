@@ -5,11 +5,13 @@ const path = require("path");
 const { init } = require("../lib/commands/init");
 const { detect } = require("../lib/commands/detect");
 const { run } = require("../lib/commands/run");
+const { update } = require("../lib/commands/update");
 
 const COMMANDS = {
   init,
   detect,
   run,
+  update,
 };
 
 function printHelp() {
@@ -22,6 +24,7 @@ function printHelp() {
       "",
       "Commands:",
       "  init      Install the .agent/ contract into the current repo (idempotent)",
+      "  update    Refresh roles, checks, templates, and stack — leave conventions/manifest untouched",
       "  detect    Run stack detection only; print result to stdout (no writes)",
       "  run       Run a role against a task via the configured provider",
       "",
@@ -38,6 +41,12 @@ function printHelp() {
       "                     nestjs-clean-architecture | laravel-service-pattern | none",
       "  --persona <name> Set the agent persona (default: pragmatist):",
       "                     pragmatist | architect | vibecoder | lead",
+      "",
+      "Flags (update):",
+      "  --persona <name> Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
+      "                     pragmatist | architect | vibecoder | lead",
+      "",
+      "Flags (init):",
       "  --learn          After init, sample existing source files and write a draft",
       "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
       "                   Nothing is auto-applied — the draft is yours to edit and merge.",

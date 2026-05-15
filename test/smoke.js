@@ -16,6 +16,7 @@ const { execSync } = require("child_process");
 const { detectStack } = require("../lib/detect");
 const { init } = require("../lib/commands/init");
 const { run } = require("../lib/commands/run");
+const { update } = require("../lib/commands/update");
 const { learnConventions } = require("../lib/learn");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "agent-contract-test-"));
@@ -472,6 +473,64 @@ function runScript(scriptPath, args) {
   }
 }
 
+async function suiteUpdate() {
+  process.stdout.write("\n[update]\n");
+
+  const target = fixture("update-target", {
+    "package.json": JSON.stringify({ name: "t", devDependencies: { jest: "^29" } }),
+    "tsconfig.json": "{}",
+  });
+
+  // init first with architect persona
+  await captureStdout(async () => init({ cwd: target, flags: { persona: "architect" } }));
+
+  // Manually corrupt a role file to confirm update refreshes it
+  const genPath = path.join(target, ".agent/roles/generator.yaml");
+  fs.writeFileSync(genPath, "CORRUPTED");
+
+  // Manually edit conventions.yaml to confirm update does NOT touch it
+  const convPath = path.join(target, ".agent/conventions.yaml");
+  const origConv = fs.readFileSync(convPath, "utf8");
+  fs.writeFileSync(convPath, origConv + "\n# USER_EDIT_MARKER\n");
+
+  // Manually edit manifest.yaml to confirm update does NOT touch it
+  const manifestPath = path.join(target, ".agent/manifest.yaml");
+  const origManifest = fs.readFileSync(manifestPath, "utf8");
+  fs.writeFileSync(manifestPath, origManifest + "\n# USER_MANIFEST_MARKER\n");
+
+  await captureStdout(async () => update({ cwd: target, flags: {} }));
+
+  // role yaml must be refreshed
+  const genAfter = fs.readFileSync(genPath, "utf8");
+  assert("update: refreshes generator.yaml", genAfter !== "CORRUPTED", genAfter.slice(0, 60));
+  assert("update: generator.yaml has role field", genAfter.includes("role: generator"), genAfter.slice(0, 80));
+
+  // persona is read from manifest.yaml (architect) and applied to roles
+  assert("update: re-applies persona from manifest (architect guidance)", genAfter.includes("guidance:"), genAfter.slice(0, 120));
+
+  // conventions.yaml must be untouched
+  const convAfter = fs.readFileSync(convPath, "utf8");
+  assert("update: does not touch conventions.yaml", convAfter.includes("USER_EDIT_MARKER"), convAfter.slice(0, 80));
+
+  // manifest.yaml must be untouched
+  const manifestAfter = fs.readFileSync(manifestPath, "utf8");
+  assert("update: does not touch manifest.yaml", manifestAfter.includes("USER_MANIFEST_MARKER"), manifestAfter.slice(0, 80));
+
+  // fails without .agent/ directory
+  const fresh = fixture("update-no-agent", { "package.json": JSON.stringify({ name: "t" }) });
+  const { stderr: updateErr, code: updateCode } = await captureAll(async () => update({ cwd: fresh, flags: {} }));
+  assert("update: fails without .agent/manifest.yaml", updateCode !== 0, updateErr);
+
+  // --persona flag overrides manifest persona
+  const target2 = fixture("update-persona-override", {
+    "package.json": JSON.stringify({ name: "t" }),
+  });
+  await captureStdout(async () => init({ cwd: target2, flags: { persona: "pragmatist" } }));
+  await captureStdout(async () => update({ cwd: target2, flags: { persona: "vibecoder" } }));
+  const genOverride = fs.readFileSync(path.join(target2, ".agent/roles/generator.yaml"), "utf8");
+  assert("update: --persona flag overrides manifest persona", genOverride.includes("ship working code first"), genOverride.slice(0, 120));
+}
+
 async function suitePersonas() {
   process.stdout.write("\n[personas]\n");
 
@@ -523,6 +582,7 @@ async function suitePersonas() {
     await suitePresets();
     await suiteLearn();
     await suitePersonas();
+    await suiteUpdate();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);
