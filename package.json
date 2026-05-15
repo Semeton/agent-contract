@@ -1,0 +1,45 @@
+{
+  "name": "@CHANGE-ME/agent-contract",
+  "version": "0.1.0",
+  "description": "Deterministic contract layer between humans and coding agents. Drop into any repo to make AI agents (Claude, Codex, Copilot, etc.) operate under explicit, enforceable rules.",
+  "keywords": [
+    "agent",
+    "ai",
+    "claude",
+    "claude-code",
+    "codex",
+    "copilot",
+    "agentic",
+    "llm",
+    "scaffolding",
+    "contract",
+    "determinism"
+  ],
+  "bin": {
+    "agent-contract": "./bin/agent-contract.js"
+  },
+  "main": "./lib/index.js",
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/smoke.js",
+    "prepublishOnly": "node test/smoke.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CHANGE-ME/agent-contract.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CHANGE-ME/agent-contract/issues"
+  },
+  "homepage": "https://github.com/CHANGE-ME/agent-contract#readme",
+  "author": "",
+  "license": "MIT"
+}

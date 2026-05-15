@@ -1,0 +1,8 @@
+test/
+fixtures/
+.github/
+.git/
+*.tgz
+*.log
+.DS_Store
+node_modules/
