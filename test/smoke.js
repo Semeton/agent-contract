@@ -472,6 +472,47 @@ function runScript(scriptPath, args) {
   }
 }
 
+async function suitePersonas() {
+  process.stdout.write("\n[personas]\n");
+
+  const mkTarget = (name) =>
+    fixture(name, { "package.json": JSON.stringify({ name: "t" }) });
+
+  // architect
+  const archTarget = mkTarget("persona-architect");
+  await captureStdout(async () => init({ cwd: archTarget, flags: { persona: "architect" } }));
+  const archConv = fs.readFileSync(path.join(archTarget, ".agent/conventions.yaml"), "utf8");
+  const archManifest = fs.readFileSync(path.join(archTarget, ".agent/manifest.yaml"), "utf8");
+  const archGen = fs.readFileSync(path.join(archTarget, ".agent/roles/generator.yaml"), "utf8");
+  assert("persona: architect sets tone.style deliberate in conventions", archConv.includes("style: deliberate"), archConv.slice(0, 120));
+  assert("persona: architect sets persona in manifest", archManifest.includes("persona: architect"), archManifest.slice(0, 80));
+  assert("persona: architect adds guidance to generator role", archGen.includes("guidance:"), archGen.slice(0, 120));
+
+  // vibecoder
+  const vibeTarget = mkTarget("persona-vibecoder");
+  await captureStdout(async () => init({ cwd: vibeTarget, flags: { persona: "vibecoder" } }));
+  const vibeConv = fs.readFileSync(path.join(vibeTarget, ".agent/conventions.yaml"), "utf8");
+  assert("persona: vibecoder sets tone.style fast in conventions", vibeConv.includes("style: fast"), vibeConv.slice(0, 120));
+
+  // lead
+  const leadTarget = mkTarget("persona-lead");
+  await captureStdout(async () => init({ cwd: leadTarget, flags: { persona: "lead" } }));
+  const leadConv = fs.readFileSync(path.join(leadTarget, ".agent/conventions.yaml"), "utf8");
+  assert("persona: lead sets tone.style mentorship in conventions", leadConv.includes("style: mentorship"), leadConv.slice(0, 120));
+
+  // pragmatist (default)
+  const pragTarget = mkTarget("persona-pragmatist");
+  await captureStdout(async () => init({ cwd: pragTarget, flags: { persona: "pragmatist" } }));
+  const pragConv = fs.readFileSync(path.join(pragTarget, ".agent/conventions.yaml"), "utf8");
+  assert("persona: pragmatist sets tone.style balanced in conventions", pragConv.includes("style: balanced"), pragConv.slice(0, 120));
+
+  // invalid persona → falls back to pragmatist
+  const fallbackTarget = mkTarget("persona-invalid");
+  await captureStdout(async () => init({ cwd: fallbackTarget, flags: { persona: "wizard" } }));
+  const fallbackConv = fs.readFileSync(path.join(fallbackTarget, ".agent/conventions.yaml"), "utf8");
+  assert("persona: invalid falls back to pragmatist (balanced)", fallbackConv.includes("style: balanced"), fallbackConv.slice(0, 120));
+}
+
 (async () => {
   process.stdout.write("agent-contract smoke test\n");
   try {
@@ -481,6 +522,7 @@ function runScript(scriptPath, args) {
     await suiteRun();
     await suitePresets();
     await suiteLearn();
+    await suitePersonas();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);

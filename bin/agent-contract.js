@@ -36,6 +36,8 @@ function printHelp() {
       "  --preset <name>  Apply a conventions preset without prompting:",
       "                     oop-strict | functional-pragmatic |",
       "                     nestjs-clean-architecture | laravel-service-pattern | none",
+      "  --persona <name> Set the agent persona (default: pragmatist):",
+      "                     pragmatist | architect | vibecoder | lead",
       "  --learn          After init, sample existing source files and write a draft",
       "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
       "                   Nothing is auto-applied — the draft is yours to edit and merge.",
@@ -106,6 +108,7 @@ function parseFlags(args) {
     else if (a === "--spec") flags.spec = args[++i];
     else if (a === "--provider") flags.provider = args[++i];
     else if (a === "--preset") flags.preset = args[++i];
+    else if (a === "--persona") flags.persona = args[++i];
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
     else flags._.push(a);
   }
