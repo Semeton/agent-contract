@@ -19,13 +19,13 @@ The premise: you can't make non-deterministic agents deterministic. You can make
 Use directly via `npx` — no global install needed:
 
 ```bash
-npx @your-scope/agent-contract init
+npx @semeton/agent-contract init
 ```
 
 Or install once:
 
 ```bash
-npm i -g @your-scope/agent-contract
+npm i -g @semeton/agent-contract
 agent-contract init
 ```
 
@@ -120,7 +120,7 @@ Re-running `init` is safe:
 ## Programmatic API
 
 ```js
-const { detectStack, init } = require('@your-scope/agent-contract');
+const { detectStack, init } = require('@semeton/agent-contract');
 
 const stack = await detectStack(process.cwd());
 console.log(stack.language, stack.framework, stack.confidence);
