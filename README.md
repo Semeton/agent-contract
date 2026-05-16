@@ -13,6 +13,7 @@ One command drops a `.agent/` scaffold into your repo:
 - **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
+- **Token management** — tracks context window usage per run. Warns at 70%, auto-generates a handoff note at 85% and prompts you to start a fresh session.
 - **Decision log instead of chat history** — `memory/decisions.jsonl` carries context across models, sessions, and tools.
 - **Discoverable by every major agent** — drops shim files at `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, all pointing to the same manifest.
 
@@ -114,6 +115,41 @@ agent-contract run --role generator --task "..." --provider echo
 3. `claude-code` — if the `claude` CLI is installed (Claude Pro/Max, no API key needed)
 4. `echo` — prints the assembled prompt, calls nothing (dry run)
 
+## Token management
+
+Every `agent-contract run` tracks how much of the model's context window the session consumed and warns you before you hit the limit.
+
+| Threshold | Behaviour |
+|---|---|
+| **80%** (pre-flight) | Warns before calling the model if the prompt alone is already large |
+| **70%** (post-call) | Prints a soft warning in the run output |
+| **85%** (post-call) | Writes a handoff note to `.agent/memory/handoff-{timestamp}.md` and prints a banner |
+
+When the 85% threshold is crossed you'll see:
+
+```
+╔══════════════════════════════════════════════════════════╗
+║  CONTEXT WINDOW AT 87% — HANDOFF GENERATED              ║
+╠══════════════════════════════════════════════════════════╣
+║  Saved: .agent/memory/handoff-1747392000000.md          ║
+║                                                          ║
+║  Start a fresh session and open that file for context.  ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+The handoff note contains the current role, task, token stats, the last 5 entries from `decisions.jsonl`, and a ready-to-paste prompt for the new session. Token usage is also recorded in each `decisions.jsonl` entry.
+
+**Known context window limits:**
+
+| Model | Limit |
+|---|---|
+| claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
+| gpt-4o / gpt-4o-mini / gpt-4-turbo | 128,000 |
+| gpt-3.5-turbo | 16,000 |
+| claude-code (CLI, estimated) | 200,000 |
+
+For providers that don't return exact token counts (claude-code CLI), usage is estimated at 1 token per 4 characters.
+
 ## Personas
 
 Set at `init` or `update` time via `--persona`. Affects the `tone:` block in `conventions.yaml` and the `guidance:` arrays in your role YAMLs.
@@ -171,7 +207,8 @@ your-repo/
 │   │   ├── pr.md
 │   │   └── debug-report.md
 │   └── memory/
-│       └── decisions.jsonl
+│       ├── decisions.jsonl
+│       └── handoff-{timestamp}.md   ← auto-generated when context window > 85%
 ├── CLAUDE.md                          ← shim → manifest
 ├── AGENTS.md                          ← shim → manifest
 ├── .cursorrules                       ← shim → manifest
