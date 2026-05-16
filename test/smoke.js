@@ -443,6 +443,78 @@ async function suiteRun() {
   assert("run: missing manifest hard-fails", noManifestCode === 1, noManifestCode);
 }
 
+async function suiteTokens() {
+  process.stdout.write("\n[tokens]\n");
+
+  const { estimateTokens, checkUsage, limitForModel, WARN_THRESHOLD, HANDOFF_THRESHOLD } = require("../lib/util/tokens");
+  const T = require("../lib/util/templates");
+
+  // estimateTokens: 4 chars per token
+  assert("tokens: estimateTokens 400 chars → 100 tokens", estimateTokens("x".repeat(400)) === 100, null);
+  assert("tokens: estimateTokens empty string → 0", estimateTokens("") === 0, null);
+
+  // limitForModel: known model returns expected limit
+  assert("tokens: limitForModel claude-opus-4-7 → 200000", limitForModel("claude-opus-4-7") === 200000, null);
+  assert("tokens: limitForModel gpt-4o → 128000", limitForModel("gpt-4o") === 128000, null);
+  assert("tokens: limitForModel unknown falls back to default", limitForModel("unknown-model-xyz") === 100000, null);
+
+  // checkUsage: calculates pct correctly
+  const info = checkUsage({ input_tokens: 140000, output_tokens: 30000 }, "claude-opus-4-7");
+  assert("tokens: checkUsage total = input + output", info.total === 170000, info.total);
+  assert("tokens: checkUsage pct = 85% for 170k/200k", info.pct === 85, info.pct);
+
+  // WARN and HANDOFF thresholds are defined
+  assert("tokens: WARN_THRESHOLD is 0.70", WARN_THRESHOLD === 0.70, WARN_THRESHOLD);
+  assert("tokens: HANDOFF_THRESHOLD is 0.85", HANDOFF_THRESHOLD === 0.85, HANDOFF_THRESHOLD);
+
+  // handoffNote template contains expected content
+  const note = T.handoffNote({
+    role: "generator",
+    task: "add auth middleware",
+    provider: "anthropic",
+    model: "claude-opus-4-7",
+    usage: { total: 170000, limit: 200000, pct: 85 },
+    recentDecisions: [
+      { ts: "2026-05-16T10:00:00.000Z", role: "generator", task: "scaffold user module", output_lines: 42 },
+    ],
+  });
+  assert("tokens: handoffNote contains title", note.includes("# Agent Handoff"), note.slice(0, 80));
+  assert("tokens: handoffNote contains role", note.includes("generator"), note.slice(0, 200));
+  assert("tokens: handoffNote contains task", note.includes("add auth middleware"), note.slice(0, 300));
+  assert("tokens: handoffNote contains pct", note.includes("85%"), note.slice(0, 400));
+  assert("tokens: handoffNote contains fresh session prompt", note.includes("fresh session"), note.slice(0, 600));
+  assert("tokens: handoffNote contains prior decision", note.includes("scaffold user module"), note);
+
+  // decisions.jsonl entry includes tokens field after a run
+  const target = fixture("tokens-run-target", {
+    "package.json": JSON.stringify({ name: "t" }),
+  });
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+  await captureAll(() =>
+    run({ cwd: target, flags: { role: "generator", task: "test task", provider: "echo" } })
+  );
+  const lastEntry = JSON.parse(
+    fs.readFileSync(path.join(target, ".agent/memory/decisions.jsonl"), "utf8")
+      .trim().split("\n").filter(Boolean).pop()
+  );
+  assert("tokens: decisions.jsonl entry includes tokens.used", typeof lastEntry.tokens?.used === "number", lastEntry);
+  assert("tokens: decisions.jsonl entry includes tokens.pct", typeof lastEntry.tokens?.pct === "number", lastEntry);
+
+  // handoff file is created when usage exceeds HANDOFF_THRESHOLD
+  // Simulate by calling handoffNote and writing manually (avoids mocking MODEL_LIMITS)
+  const handoffTarget = fixture("tokens-handoff-target", { "package.json": JSON.stringify({ name: "t" }) });
+  await captureStdout(async () => init({ cwd: handoffTarget, flags: {} }));
+  const handoffDir = path.join(handoffTarget, ".agent/memory");
+  const handoffContent = T.handoffNote({
+    role: "generator", task: "big task", provider: "echo", model: "echo",
+    usage: { total: 90000, limit: 100000, pct: 90 }, recentDecisions: [],
+  });
+  const handoffFile = path.join(handoffDir, `handoff-test.md`);
+  fs.writeFileSync(handoffFile, handoffContent);
+  const written = fs.readFileSync(handoffFile, "utf8");
+  assert("tokens: handoff file is valid markdown", written.startsWith("# Agent Handoff"), written.slice(0, 60));
+}
+
 function captureStdout(fn) {
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = () => true;
@@ -583,6 +655,7 @@ async function suitePersonas() {
     await suiteLearn();
     await suitePersonas();
     await suiteUpdate();
+    await suiteTokens();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);
