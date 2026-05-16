@@ -556,29 +556,25 @@ async function suiteUpdate() {
   // init first with architect persona
   await captureStdout(async () => init({ cwd: target, flags: { persona: "architect" } }));
 
-  // Manually corrupt a role file to confirm update refreshes it
+  // Put a user edit marker in roles and conventions to verify preservation
   const genPath = path.join(target, ".agent/roles/generator.yaml");
-  fs.writeFileSync(genPath, "CORRUPTED");
+  const origGen = fs.readFileSync(genPath, "utf8");
+  fs.writeFileSync(genPath, origGen + "\n# USER_ROLE_EDIT\n");
 
-  // Manually edit conventions.yaml to confirm update does NOT touch it
   const convPath = path.join(target, ".agent/conventions.yaml");
   const origConv = fs.readFileSync(convPath, "utf8");
   fs.writeFileSync(convPath, origConv + "\n# USER_EDIT_MARKER\n");
 
-  // Manually edit manifest.yaml to confirm update does NOT touch it
   const manifestPath = path.join(target, ".agent/manifest.yaml");
   const origManifest = fs.readFileSync(manifestPath, "utf8");
   fs.writeFileSync(manifestPath, origManifest + "\n# USER_MANIFEST_MARKER\n");
 
+  // Default update — preserves roles, templates, conventions, manifest
   await captureStdout(async () => update({ cwd: target, flags: {} }));
 
-  // role yaml must be refreshed
+  // roles must be preserved
   const genAfter = fs.readFileSync(genPath, "utf8");
-  assert("update: refreshes generator.yaml", genAfter !== "CORRUPTED", genAfter.slice(0, 60));
-  assert("update: generator.yaml has role field", genAfter.includes("role: generator"), genAfter.slice(0, 80));
-
-  // persona is read from manifest.yaml (architect) and applied to roles
-  assert("update: re-applies persona from manifest (architect guidance)", genAfter.includes("guidance:"), genAfter.slice(0, 120));
+  assert("update: preserves user edits in role yaml by default", genAfter.includes("USER_ROLE_EDIT"), genAfter.slice(0, 80));
 
   // conventions.yaml must be untouched
   const convAfter = fs.readFileSync(convPath, "utf8");
@@ -588,19 +584,35 @@ async function suiteUpdate() {
   const manifestAfter = fs.readFileSync(manifestPath, "utf8");
   assert("update: does not touch manifest.yaml", manifestAfter.includes("USER_MANIFEST_MARKER"), manifestAfter.slice(0, 80));
 
-  // fails without .agent/ directory
-  const fresh = fixture("update-no-agent", { "package.json": JSON.stringify({ name: "t" }) });
-  const { stderr: updateErr, code: updateCode } = await captureAll(async () => update({ cwd: fresh, flags: {} }));
-  assert("update: fails without .agent/manifest.yaml", updateCode !== 0, updateErr);
+  // stack.yaml IS always refreshed (it's auto-generated)
+  const stackPath = path.join(target, ".agent/stack.yaml");
+  assert("update: always refreshes stack.yaml", fs.existsSync(stackPath), null);
 
-  // --persona flag overrides manifest persona
-  const target2 = fixture("update-persona-override", {
+  // --force overwrites roles and templates
+  const forceTarget = fixture("update-force-target", {
     "package.json": JSON.stringify({ name: "t" }),
   });
-  await captureStdout(async () => init({ cwd: target2, flags: { persona: "pragmatist" } }));
-  await captureStdout(async () => update({ cwd: target2, flags: { persona: "vibecoder" } }));
-  const genOverride = fs.readFileSync(path.join(target2, ".agent/roles/generator.yaml"), "utf8");
-  assert("update: --persona flag overrides manifest persona", genOverride.includes("ship working code first"), genOverride.slice(0, 120));
+  await captureStdout(async () => init({ cwd: forceTarget, flags: { persona: "architect" } }));
+  const forceGenPath = path.join(forceTarget, ".agent/roles/generator.yaml");
+  fs.writeFileSync(forceGenPath, "CORRUPTED");
+  await captureStdout(async () => update({ cwd: forceTarget, flags: { force: true } }));
+  const forceGenAfter = fs.readFileSync(forceGenPath, "utf8");
+  assert("update: --force overwrites roles", forceGenAfter !== "CORRUPTED", forceGenAfter.slice(0, 60));
+  assert("update: --force role has role field", forceGenAfter.includes("role: generator"), forceGenAfter.slice(0, 80));
+
+  // --persona + --force re-applies persona to roles
+  const personaTarget = fixture("update-persona-force", {
+    "package.json": JSON.stringify({ name: "t" }),
+  });
+  await captureStdout(async () => init({ cwd: personaTarget, flags: { persona: "pragmatist" } }));
+  await captureStdout(async () => update({ cwd: personaTarget, flags: { persona: "vibecoder", force: true } }));
+  const personaGen = fs.readFileSync(path.join(personaTarget, ".agent/roles/generator.yaml"), "utf8");
+  assert("update: --persona + --force re-applies persona to roles", personaGen.includes("ship working code first"), personaGen.slice(0, 120));
+
+  // fails without .agent/ directory
+  const fresh = fixture("update-no-agent", { "package.json": JSON.stringify({ name: "t" }) });
+  const updateCode = await captureAll(async () => update({ cwd: fresh, flags: {} }));
+  assert("update: fails without .agent/manifest.yaml", updateCode !== 0, updateCode);
 }
 
 async function suitePersonas() {

@@ -1,6 +1,6 @@
 {
   "name": "@semeton/agent-contract",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Deterministic contract layer between humans and coding agents. Drop into any repo to make AI agents (Claude, Codex, Copilot, etc.) operate under explicit, enforceable rules.",
   "keywords": [
     "agent",
