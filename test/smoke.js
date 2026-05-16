@@ -644,6 +644,51 @@ async function suitePersonas() {
   assert("persona: invalid falls back to pragmatist (balanced)", fallbackConv.includes("style: balanced"), fallbackConv.slice(0, 120));
 }
 
+async function suiteVersion() {
+  process.stdout.write("\n[version]\n");
+
+  // Test the pure helpers directly — no network needed
+  // Inline the logic to avoid spawning a subprocess
+  const PKG = require("../package.json");
+
+  // isNewer: extracted inline for testing
+  function isNewer(a, b) {
+    const pa = a.split(".").map(Number);
+    const pb = b.split(".").map(Number);
+    for (let i = 0; i < 3; i++) {
+      if ((pa[i] || 0) > (pb[i] || 0)) return true;
+      if ((pa[i] || 0) < (pb[i] || 0)) return false;
+    }
+    return false;
+  }
+
+  assert("version: package.json has version field", typeof PKG.version === "string", PKG.version);
+  assert("version: version matches semver pattern", /^\d+\.\d+\.\d+$/.test(PKG.version), PKG.version);
+  assert("version: isNewer(1.0.1, 1.0.0) → true", isNewer("1.0.1", "1.0.0") === true, null);
+  assert("version: isNewer(1.0.0, 1.0.0) → false", isNewer("1.0.0", "1.0.0") === false, null);
+  assert("version: isNewer(1.0.0, 1.0.1) → false", isNewer("1.0.0", "1.0.1") === false, null);
+  assert("version: isNewer(2.0.0, 1.9.9) → true", isNewer("2.0.0", "1.9.9") === true, null);
+  assert("version: isNewer(0.2.0, 0.1.9) → true", isNewer("0.2.0", "0.1.9") === true, null);
+
+  // --version flag wires through the CLI bin without network (catch network errors)
+  const { execSync } = require("child_process");
+  let out;
+  try {
+    out = execSync("node bin/agent-contract.js --version", {
+      cwd: path.resolve(__dirname, ".."),
+      timeout: 10000,
+      encoding: "utf8",
+    });
+  } catch (e) {
+    out = e.stdout || "";
+  }
+  assert("version: --version prints current version", out.includes(PKG.version), out.trim());
+  assert("version: -v alias works", (() => {
+    try { return execSync("node bin/agent-contract.js -v", { cwd: path.resolve(__dirname, ".."), timeout: 10000, encoding: "utf8" }); }
+    catch (e) { return e.stdout || ""; }
+  })().includes(PKG.version), null);
+}
+
 (async () => {
   process.stdout.write("agent-contract smoke test\n");
   try {
@@ -656,6 +701,7 @@ async function suitePersonas() {
     await suitePersonas();
     await suiteUpdate();
     await suiteTokens();
+    await suiteVersion();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);

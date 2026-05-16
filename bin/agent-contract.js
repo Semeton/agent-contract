@@ -2,10 +2,13 @@
 "use strict";
 
 const path = require("path");
+const https = require("https");
 const { init } = require("../lib/commands/init");
 const { detect } = require("../lib/commands/detect");
 const { run } = require("../lib/commands/run");
 const { update } = require("../lib/commands/update");
+
+const PKG = require("../package.json");
 
 const COMMANDS = {
   init,
@@ -32,6 +35,7 @@ function printHelp() {
       "  --cwd <path>     Run against the given directory (default: process.cwd())",
       "  --dry-run        Show what would happen without writing or calling a provider",
       "  --help, -h       Show this message",
+      "  --version, -v    Print installed version and check for updates",
       "",
       "Flags (init):",
       "  --yes, -y        Accept all defaults; skip the preset prompt",
@@ -41,15 +45,13 @@ function printHelp() {
       "                     nestjs-clean-architecture | laravel-service-pattern | none",
       "  --persona <name> Set the agent persona (default: pragmatist):",
       "                     pragmatist | architect | vibecoder | lead",
+      "  --learn          After init, sample existing source files and write a draft",
+      "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
+      "                   Nothing is auto-applied — the draft is yours to edit and merge.",
       "",
       "Flags (update):",
       "  --persona <name> Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
       "                     pragmatist | architect | vibecoder | lead",
-      "",
-      "Flags (init):",
-      "  --learn          After init, sample existing source files and write a draft",
-      "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
-      "                   Nothing is auto-applied — the draft is yours to edit and merge.",
       "",
       "Flags (run):",
       "  --role <name>    Role to activate: generator | integrator | tester | debugger | documenter",
@@ -74,10 +76,64 @@ function printHelp() {
   );
 }
 
+async function checkVersion() {
+  const current = PKG.version;
+  process.stdout.write(`agent-contract ${current}\n`);
+
+  try {
+    const latest = await fetchLatestVersion(PKG.name);
+    if (latest === current) {
+      process.stdout.write(`✓ up to date (latest: ${latest})\n`);
+    } else if (isNewer(latest, current)) {
+      process.stdout.write(`! update available: ${current} → ${latest}\n`);
+      process.stdout.write(`  run: npm i -g ${PKG.name}\n`);
+    } else {
+      process.stdout.write(`  registry: ${latest}\n`);
+    }
+  } catch {
+    process.stdout.write("  (could not reach registry to check for updates)\n");
+  }
+}
+
+function fetchLatestVersion(pkgName) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      `https://registry.npmjs.org/${encodeURIComponent(pkgName)}/latest`,
+      { headers: { Accept: "application/json" } },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => { data += c; });
+        res.on("end", () => {
+          try { resolve(JSON.parse(data).version); }
+          catch { reject(new Error("bad registry response")); }
+        });
+      }
+    );
+    req.setTimeout(5000, () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+  });
+}
+
+// Simple semver comparison — returns true if `a` is newer than `b`.
+function isNewer(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
     printHelp();
+    process.exit(0);
+  }
+
+  if (argv.includes("--version") || argv.includes("-v")) {
+    await checkVersion();
     process.exit(0);
   }
 
@@ -108,7 +164,8 @@ function parseFlags(args) {
   const flags = { _: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--yes" || a === "-y") flags.yes = true;
+    if (a === "--version" || a === "-v") flags.version = true;
+    else if (a === "--yes" || a === "-y") flags.yes = true;
     else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "--force") flags.force = true;
     else if (a === "--cwd") flags.cwd = args[++i];
