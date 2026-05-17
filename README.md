@@ -7,8 +7,8 @@ Most "agent guidance" today is markdown prose: `CLAUDE.md`, `AGENTS.md`, `.curso
 One command drops a `.agent/` scaffold into your repo:
 
 - **Stack auto-detection** — language, framework, ORM, DB, test runner, lint, formatter across 14 stacks.
-- **Roles as scoped contracts** — generator, integrator, tester, debugger, documenter. Each role's YAML declares what it may create, modify, delete.
-- **Checks as hard gates** — pre-/post-generate and debug-scope scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
+- **Roles as scoped contracts** — generator, integrator, tester, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete.
+- **Checks as hard gates** — pre-/post-generate, debug-scope, and security-audit scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
 - **Per-stack linting/testing in checks** — `post-generate.sh` calls the right linter, typechecker, and test runner for your stack automatically.
 - **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
@@ -197,11 +197,13 @@ your-repo/
 │   │   ├── integrator.yaml
 │   │   ├── tester.yaml
 │   │   ├── debugger.yaml
-│   │   └── documenter.yaml
+│   │   ├── documenter.yaml
+│   │   └── security.yaml
 │   ├── checks/               ← executable gates (stack-aware)
 │   │   ├── pre-generate.sh
 │   │   ├── post-generate.sh
-│   │   └── debug-scope.sh
+│   │   ├── debug-scope.sh
+│   │   └── security-audit.sh
 │   ├── templates/
 │   │   ├── commit.txt
 │   │   ├── pr.md
@@ -253,6 +255,19 @@ refactor_policy: forbidden_unless_explicitly_approved
 ```
 
 The agent literally cannot skip `await_human_selection` because `debug-scope.sh` exits non-zero when it does.
+
+### Security role
+
+The security role is a read-only auditor — it never modifies source, only emits findings. `security-audit.sh` hard-fails on:
+
+| Gate | What it checks |
+|---|---|
+| **Exposed credentials** | `password=`, `api_key=`, `token=`, `secret=`, AWS keys, PEM private key headers in changed files |
+| **.env committed to git** | Any `.env` file tracked by the repository |
+| **Insecure patterns** | `eval()`, `innerHTML`, `dangerouslySetInnerHTML`, `shell=True`, `os.system()`, `MD5()`, `Math.random()` in source files |
+| **Vulnerable dependencies** | `npm audit` (critical + high) for Node projects; `safety check` for Python projects |
+
+Persona guidance is applied here too — `architect` classifies findings by OWASP category; `lead` explains each finding in plain English with a remediation step; `vibecoder` flags blockers only.
 
 ## Idempotency
 
