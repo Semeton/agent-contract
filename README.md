@@ -13,8 +13,11 @@ One command drops a `.agent/` scaffold into your repo:
 - **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
-- **Token management** — tracks context window usage per run. Warns at 70%, auto-generates a handoff note at 85% and prompts you to start a fresh session.
+- **Codebase memory map** — on every `init` and `update`, scans the repo and writes `.agent/memory/codebase-map.md`: a structured index of your directory tree, entry points, key config files, and top-level dependencies. Agents consult the map before reading source files, saving tokens on every session.
+- **Session handoff protocol** — the contract shim instructs agents to write a handoff note at task completion and load the most recent one at session start. Context is never silently lost across sessions.
+- **Token management** — tracks context window usage per run. Warns at 70%, writes a handoff note at 85% and on every successful task completion.
 - **Decision log instead of chat history** — `memory/decisions.jsonl` carries context across models, sessions, and tools.
+- **Self-updating** — `agent-contract update` checks npm for a newer version first. If one exists, it installs it globally and re-execs with the new templates automatically.
 - **Discoverable by every major agent** — drops shim files at `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, all pointing to the same manifest.
 
 The premise: you can't make non-deterministic agents deterministic. You can make the **system around them** deterministic so non-determinism is contained to small, verifiable units.
@@ -66,20 +69,23 @@ agent-contract init --cwd ../other-repo
 
 ### Update
 
-Refresh roles, checks, templates, and stack detection — leave `conventions.yaml` and `manifest.yaml` untouched:
+Refresh roles, checks, templates, stack detection, and the codebase map — leave `conventions.yaml` and `manifest.yaml` untouched:
 
 ```bash
-# Refresh with the persona already in manifest.yaml
+# Check for a newer version of agent-contract, install it, then update the project
 agent-contract update
 
 # Re-apply a different persona to role YAMLs
 agent-contract update --persona vibecoder
 
-# Preview what would change
+# Preview what would change (skips the version check)
 agent-contract update --dry-run
+
+# Skip the npm version check (useful in CI or offline environments)
+agent-contract update --skip-self-update
 ```
 
-Use `update` instead of `--force` when you want to pick up new role templates or stack-aware checks from a newer version of `agent-contract` without overwriting your conventions.
+**Self-update flow:** when a newer version is published to npm, `agent-contract update` installs it globally and re-runs the update command with the new binary — so you always get the latest templates, checks, and shim content without a separate upgrade step.
 
 ### Detect
 
@@ -115,17 +121,82 @@ agent-contract run --role generator --task "..." --provider echo
 3. `claude-code` — if the `claude` CLI is installed (Claude Pro/Max, no API key needed)
 4. `echo` — prints the assembled prompt, calls nothing (dry run)
 
+## Session continuity
+
+One of the core problems with AI agents is that context is lost between sessions — decisions get forgotten, files get re-read, work gets repeated.
+
+`agent-contract` addresses this at three levels:
+
+### 1. Boot sequence (always enforced)
+
+Every shim file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`) now contains a mandatory boot sequence the agent must run at the start of every session:
+
+1. Check `.agent/memory/` for any `handoff-*.md` files. Read the most recent one before proceeding.
+2. Read `.agent/manifest.yaml` to load the full contract.
+3. Read `.agent/memory/codebase-map.md` — use this as the index. Do not read raw source files before consulting the map.
+4. Load the relevant role from `.agent/roles/<role>.yaml`.
+5. Run `.agent/checks/pre-generate.sh` before generating any code.
+
+The contract is declared **non-optional** — it applies to every session, every task, every model, without needing to be mentioned in the prompt.
+
+### 2. Codebase map
+
+On every `init` and `update`, `agent-contract` scans the repo and writes `.agent/memory/codebase-map.md`:
+
+```markdown
+# Codebase Map
+Type: existing
+Language: typescript
+Framework: nestjs
+
+## Directory Structure
+src/
+  modules/
+    users/
+    orders/
+  common/
+tests/
+
+## Entry Points
+- src/main.ts
+
+## Key Config Files
+- package.json
+- tsconfig.json
+
+## Top-Level Dependencies
+@nestjs/core, @nestjs/typeorm, pg, redis
+
+## Agent Usage Protocol
+1. Read this file BEFORE reading individual source files.
+2. Use the directory structure above to decide which files to read.
+...
+```
+
+For greenfield projects (fewer than 5 source files), the map notes it's a new codebase and instructs the agent to architect from scratch.
+
+### 3. Handoff notes
+
+A handoff note is written:
+
+- **At task completion** — after every successful `agent-contract run`, a note is saved to `.agent/memory/handoff-done-{timestamp}.md` with the role, task, token stats, and last 5 decisions.
+- **At 85% context window** — a banner is shown and a second note is saved if context is running low.
+- **By the agent directly** — the shim instructs agents (Claude Code, Cursor, etc.) to fill in `.agent/templates/handoff.md` and write it to `.agent/memory/` when a task is done, then tell you to start a fresh session.
+
+The boot sequence picks up the most recent handoff automatically, so the next session starts with full context.
+
 ## Token management
 
-Every `agent-contract run` tracks how much of the model's context window the session consumed and warns you before you hit the limit.
+Every `agent-contract run` tracks context window usage and acts before you hit the limit.
 
 | Threshold | Behaviour |
 |---|---|
 | **80%** (pre-flight) | Warns before calling the model if the prompt alone is already large |
 | **70%** (post-call) | Prints a soft warning in the run output |
-| **85%** (post-call) | Writes a handoff note to `.agent/memory/handoff-{timestamp}.md` and prints a banner |
+| **85%** (post-call) | Writes a threshold handoff note and prints a banner |
+| **Task completion** | Always writes a completion handoff note regardless of token count |
 
-When the 85% threshold is crossed you'll see:
+When the 85% threshold is crossed:
 
 ```
 ╔══════════════════════════════════════════════════════════╗
@@ -137,7 +208,7 @@ When the 85% threshold is crossed you'll see:
 ╚══════════════════════════════════════════════════════════╝
 ```
 
-The handoff note contains the current role, task, token stats, the last 5 entries from `decisions.jsonl`, and a ready-to-paste prompt for the new session. Token usage is also recorded in each `decisions.jsonl` entry.
+The handoff note contains the current role, task, token stats, the last 5 entries from `decisions.jsonl`, and a ready-to-paste prompt for the new session.
 
 **Known context window limits:**
 
@@ -188,18 +259,18 @@ Infers: paradigm (OOP vs functional), error style, file naming convention, test 
 ```
 your-repo/
 ├── .agent/
-│   ├── manifest.yaml         ← single entrypoint (persona, stack refs, enforcement policy)
-│   ├── stack.yaml            ← auto-generated; language/framework facts + shell commands
-│   ├── conventions.yaml      ← engineering rules (paradigm, tone, module size, DB policy…)
-│   ├── config.yaml           ← provider/model config (not committed if sensitive)
-│   ├── roles/                ← one YAML per role
+│   ├── manifest.yaml             ← single entrypoint (persona, stack refs, enforcement policy)
+│   ├── stack.yaml                ← auto-generated; language/framework facts + shell commands
+│   ├── conventions.yaml          ← engineering rules (paradigm, tone, module size, DB policy…)
+│   ├── config.yaml               ← provider/model config
+│   ├── roles/                    ← one YAML per role
 │   │   ├── generator.yaml
 │   │   ├── integrator.yaml
 │   │   ├── tester.yaml
 │   │   ├── debugger.yaml
 │   │   ├── documenter.yaml
 │   │   └── security.yaml
-│   ├── checks/               ← executable gates (stack-aware)
+│   ├── checks/                   ← executable gates (stack-aware)
 │   │   ├── pre-generate.sh
 │   │   ├── post-generate.sh
 │   │   ├── debug-scope.sh
@@ -207,14 +278,16 @@ your-repo/
 │   ├── templates/
 │   │   ├── commit.txt
 │   │   ├── pr.md
-│   │   └── debug-report.md
+│   │   ├── debug-report.md
+│   │   └── handoff.md            ← fill-in template agents complete at task end
 │   └── memory/
-│       ├── decisions.jsonl
-│       └── handoff-{timestamp}.md   ← auto-generated when context window > 85%
-├── CLAUDE.md                          ← shim → manifest
-├── AGENTS.md                          ← shim → manifest
-├── .cursorrules                       ← shim → manifest
-└── .github/copilot-instructions.md   ← shim → manifest
+│       ├── decisions.jsonl                    ← append-only decision log
+│       ├── codebase-map.md                    ← auto-generated repo index (refreshed on update)
+│       └── handoff-done-{timestamp}.md        ← written after every completed task
+├── CLAUDE.md                                  ← shim with boot sequence → manifest
+├── AGENTS.md                                  ← shim with boot sequence → manifest
+├── .cursorrules                               ← shim with boot sequence → manifest
+└── .github/copilot-instructions.md           ← shim with boot sequence → manifest
 ```
 
 ## Design
@@ -274,10 +347,10 @@ Persona guidance is applied here too — `architect` classifies findings by OWAS
 Re-running `init` is safe:
 
 - Existing contract files are skipped.
-- `stack.yaml` is always refreshed (it should reflect current reality).
+- `stack.yaml` and `codebase-map.md` are always refreshed (they reflect current reality).
 - Shim files (`CLAUDE.md`, `AGENTS.md`, etc.) preserve user content; the contract shim is appended once, marked with HTML comments to prevent duplication.
 
-For picking up new templates or stack-aware checks from a newer version without overwriting your conventions, use `agent-contract update` instead of `--force`.
+For picking up new templates or stack-aware checks from a newer version without overwriting your conventions, use `agent-contract update` — it self-updates the tool first, then refreshes the project.
 
 ## Programmatic API
 
@@ -289,13 +362,13 @@ const stack = await detectStack(process.cwd());
 console.log(stack.language, stack.framework, stack.confidence);
 // stack.commands has ready-to-run lint/typecheck/test commands
 
-// Install contract
+// Install contract (generates codebase map + handoff template)
 await init({ cwd: process.cwd(), flags: { dryRun: true } });
 
-// Selective refresh
+// Selective refresh (always refreshes stack.yaml + codebase-map.md)
 await update({ cwd: process.cwd(), flags: { persona: 'architect' } });
 
-// Run a role
+// Run a role (writes completion handoff on success)
 await run({ cwd: process.cwd(), flags: { role: 'generator', task: 'add auth middleware' } });
 ```
 
