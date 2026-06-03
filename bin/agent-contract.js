@@ -3,6 +3,7 @@
 
 const path = require("path");
 const https = require("https");
+const { execFileSync, execSync } = require("child_process");
 const { init } = require("../lib/commands/init");
 const { detect } = require("../lib/commands/detect");
 const { run } = require("../lib/commands/run");
@@ -50,8 +51,9 @@ function printHelp() {
       "                   Nothing is auto-applied — the draft is yours to edit and merge.",
       "",
       "Flags (update):",
-      "  --persona <name> Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
-      "                     pragmatist | architect | vibecoder | lead",
+      "  --persona <name>       Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
+      "                           pragmatist | architect | vibecoder | lead",
+      "  --skip-self-update     Skip the automatic npm version check (useful in CI or offline environments)",
       "",
       "Flags (run):",
       "  --role <name>    Role to activate: generator | integrator | tester | debugger | documenter",
@@ -125,6 +127,48 @@ function isNewer(a, b) {
   return false;
 }
 
+// Self-update: checks npm registry, installs newer version if available, then re-execs.
+// Returns true if a new version was installed (caller should exit after).
+async function attemptSelfUpdate(cwd, updateArgv) {
+  process.stdout.write("  checking for updates…\n");
+  let latest;
+  try {
+    latest = await fetchLatestVersion(PKG.name);
+  } catch {
+    process.stdout.write("  (could not reach registry — skipping update check)\n\n");
+    return false;
+  }
+
+  if (!latest || !isNewer(latest, PKG.version)) {
+    process.stdout.write(`  ✓ ${PKG.name} is up to date (${PKG.version})\n\n`);
+    return false;
+  }
+
+  process.stdout.write(`  new version available: ${PKG.version} → ${latest}\n`);
+  process.stdout.write(`  installing ${PKG.name}@${latest} globally…\n`);
+  try {
+    execSync(`npm install -g ${PKG.name}@${latest}`, { stdio: "pipe" });
+  } catch (e) {
+    const hint = (e.stderr || e.message || "").toString().slice(0, 200);
+    process.stderr.write(`  ✗ install failed: ${hint}\n`);
+    process.stderr.write(`  run manually: npm install -g ${PKG.name}\n\n`);
+    return false;
+  }
+  process.stdout.write(`  ✓ updated to ${latest} — re-running update with new version…\n\n`);
+
+  const reArgs = [...updateArgv.filter((a) => a !== "--skip-self-update"), "--skip-self-update"];
+  // cwd may have been resolved; pass it explicitly so the re-exec targets the same directory
+  if (!reArgs.includes("--cwd") && cwd !== process.cwd()) {
+    reArgs.push("--cwd", cwd);
+  }
+  try {
+    execFileSync("agent-contract", ["update", ...reArgs], { stdio: "inherit" });
+  } catch (e) {
+    process.exit(e.status || 1);
+  }
+  return true;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
@@ -148,6 +192,12 @@ async function main() {
 
   const cwd = path.resolve(flags.cwd || process.cwd());
 
+  // Self-update gate: runs only for `update`, only when online and not already re-execed.
+  if (command === "update" && !flags.skipSelfUpdate && !flags.dryRun) {
+    const selfUpdated = await attemptSelfUpdate(cwd, argv.slice(1));
+    if (selfUpdated) process.exit(0);
+  }
+
   try {
     const exitCode = await COMMANDS[command]({ cwd, flags });
     process.exit(exitCode || 0);
@@ -168,6 +218,7 @@ function parseFlags(args) {
     else if (a === "--yes" || a === "-y") flags.yes = true;
     else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "--force") flags.force = true;
+    else if (a === "--skip-self-update") flags.skipSelfUpdate = true;
     else if (a === "--cwd") flags.cwd = args[++i];
     else if (a === "--role") flags.role = args[++i];
     else if (a === "--task") flags.task = args[++i];

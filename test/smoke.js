@@ -18,6 +18,7 @@ const { init } = require("../lib/commands/init");
 const { run } = require("../lib/commands/run");
 const { update } = require("../lib/commands/update");
 const { learnConventions } = require("../lib/learn");
+const { buildCodebaseMap, isGreenfield } = require("../lib/util/map");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "agent-contract-test-"));
 let failures = 0;
@@ -226,6 +227,8 @@ async function suiteInit() {
     ".agent/checks/pre-generate.sh",
     ".agent/checks/post-generate.sh",
     ".agent/checks/debug-scope.sh",
+    ".agent/memory/codebase-map.md",
+    ".agent/templates/handoff.md",
     "CLAUDE.md",
     "AGENTS.md",
     ".cursorrules",
@@ -235,6 +238,16 @@ async function suiteInit() {
     const abs = path.join(target, rel);
     assert(`init creates ${rel}`, fs.existsSync(abs));
   }
+
+  // codebase-map content: should contain the marker and boot protocol reference
+  const codemapContent = fs.readFileSync(path.join(target, ".agent/memory/codebase-map.md"), "utf8");
+  assert("init: codebase-map.md has opening marker", codemapContent.includes("<!-- agent-contract:codebase-map -->"));
+  assert("init: codebase-map.md has closing marker", codemapContent.includes("<!-- /agent-contract:codebase-map -->"));
+
+  // shim contains the new boot sequence
+  const claudeMd = fs.readFileSync(path.join(target, "CLAUDE.md"), "utf8");
+  assert("init: CLAUDE.md shim references boot sequence", claudeMd.includes("Boot Sequence"));
+  assert("init: CLAUDE.md shim references handoff protocol", claudeMd.includes("Session Handoff Protocol"));
 
   // checks must be executable
   for (const rel of [
@@ -428,6 +441,11 @@ async function suiteRun() {
   const lastLine = decisionsRaw.split("\n").filter((l) => l.trim()).pop();
   const entry = JSON.parse(lastLine);
   assert("run: appends to decisions.jsonl", entry.role === "generator", entry);
+
+  // Completion handoff should be written after every successful run
+  const memDir = path.join(target, ".agent/memory");
+  const handoffFiles = fs.readdirSync(memDir).filter((f) => f.startsWith("handoff-done-") && f.endsWith(".md"));
+  assert("run: completion handoff written after success", handoffFiles.length > 0, handoffFiles);
 
   // missing role must hard-fail
   const failCode = await captureAll(() =>
@@ -656,6 +674,41 @@ async function suitePersonas() {
   assert("persona: invalid falls back to pragmatist (balanced)", fallbackConv.includes("style: balanced"), fallbackConv.slice(0, 120));
 }
 
+async function suiteMap() {
+  process.stdout.write("\n[map]\n");
+
+  // Empty dir is greenfield
+  const empty = fixture("map-empty", { "README.md": "# hi" });
+  assert("map: dir with no source files is greenfield", isGreenfield(empty) === true);
+
+  // Dir with source files is not greenfield
+  const existing = fixture("map-existing", {
+    "package.json": JSON.stringify({ name: "t", dependencies: { "@nestjs/core": "^10" } }),
+    "src/main.ts": "const x = 1;",
+    "src/app.ts": "const y = 2;",
+    "src/users/users.service.ts": "class UsersService {}",
+    "src/users/users.controller.ts": "class UsersController {}",
+    "src/orders/orders.service.ts": "class OrdersService {}",
+  });
+  assert("map: dir with source files is not greenfield", isGreenfield(existing) === false);
+
+  // Greenfield map format
+  const gMap = buildCodebaseMap(empty, { language: "unknown" });
+  assert("map: greenfield map has type marker", gMap.includes("Type: greenfield"));
+  assert("map: greenfield map has opening marker", gMap.includes("<!-- agent-contract:codebase-map -->"));
+  assert("map: greenfield map has closing marker", gMap.includes("<!-- /agent-contract:codebase-map -->"));
+  assert("map: greenfield map omits agent usage for architecture", gMap.includes("Architect the solution"));
+
+  // Existing map format
+  const det = await detectStack(existing);
+  const eMap = buildCodebaseMap(existing, det);
+  assert("map: existing map has type marker", eMap.includes("Type: existing"));
+  assert("map: existing map has directory structure", eMap.includes("src/"));
+  assert("map: existing map has agent usage protocol", eMap.includes("Agent Usage Protocol"));
+  assert("map: existing map has key config files", eMap.includes("package.json"));
+  assert("map: existing map lists nestjs dep", eMap.includes("@nestjs/core"));
+}
+
 async function suiteVersion() {
   process.stdout.write("\n[version]\n");
 
@@ -713,6 +766,7 @@ async function suiteVersion() {
     await suitePersonas();
     await suiteUpdate();
     await suiteTokens();
+    await suiteMap();
     await suiteVersion();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
