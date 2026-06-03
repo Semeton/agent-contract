@@ -5,3 +5,8 @@ node_modules/
 .env
 coverage/
 HANDOFF.md
+.DS_Store
+.agent/
+.cursorrules
+.claude
+.github/copilot-instructions.md

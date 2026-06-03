@@ -755,12 +755,19 @@ async function suiteHooks() {
   const writeHandoff = path.join(target, ".agent/checks/write-handoff.sh");
   const sessionDir = path.join(target, ".agent/session");
 
-  // scope-check: no active-role.txt → always passes (exit 0)
+  // scope-check: no active-role.txt → fail-closed (exit 1) for source writes
   const noRoleCode = runScriptWithInput(
     scopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/foo.ts"), content: "x" } })
   );
-  assert("scope-check: exits 0 when no active-role.txt", noRoleCode === 0, noRoleCode);
+  assert("scope-check: exits 1 when no active-role.txt (fail-closed)", noRoleCode === 1, noRoleCode);
+
+  // scope-check: no active-role.txt → .agent/ infra writes always pass
+  const noRoleAgentCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/session/active-role.txt"), content: "generator" } })
+  );
+  assert("scope-check: exits 0 for .agent/ writes when no active-role.txt", noRoleAgentCode === 0, noRoleAgentCode);
 
   // scope-check: active role "tester" (may_create/modify: tests/**)
   fs.mkdirSync(sessionDir, { recursive: true });

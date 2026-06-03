@@ -7,11 +7,12 @@ Most "agent guidance" today is markdown prose: `CLAUDE.md`, `AGENTS.md`, `.curso
 One command drops a `.agent/` scaffold into your repo:
 
 - **Stack auto-detection** — language, framework, ORM, DB, test runner, lint, formatter across 14 stacks.
-- **Roles as scoped contracts** — generator, integrator, tester, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete.
+- **Roles as scoped contracts** — generator, integrator, tester, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete. Scopes are generated from detected framework: a Laravel init gets `app/**, config/**, routes/**`; a Rails init gets `app/**, config/**, db/**`; a NestJS init gets `src/**`. No more hardcoded `src/**` for every stack.
 - **Checks as hard gates** — pre-/post-generate, debug-scope, and security-audit scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
 - **Per-stack linting/testing in checks** — `post-generate.sh` calls the right linter, typechecker, and test runner for your stack automatically.
+- **Conventions enforcement** — `post-generate.sh` reads `max_lines_per_file` and `new_packages` policy directly from `conventions.yaml`. If a file exceeds the declared limit or `package.json` changes without a logged approval, the check hard-fails.
 - **Claude Code hooks** — `init` writes `.claude/settings.json` with two hooks: a `PreToolUse` hook that blocks out-of-scope file writes _before_ they happen, and a `Stop` hook that auto-writes a handoff note after every turn that produces git changes. No model cooperation required.
-- **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`.
+- **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`. Persona now affects check behaviour, not just guidance text: `architect` hard-fails when >3 files change with no decision logged; `vibecoder` skips the coverage gate entirely.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
 - **Codebase memory map** — on every `init` and `update`, scans the repo and writes `.agent/memory/codebase-map.md`: a structured index of your directory tree, entry points, key config files, and top-level dependencies. Agents consult the map before reading source files, saving tokens on every session.
@@ -314,8 +315,8 @@ Defaults to **hard-fail**: scope violations exit non-zero. Enforcement runs at t
 
 | Layer | When | Mechanism |
 |---|---|---|
-| **PreToolUse hook** | Before each file write | `scope-check.sh` reads the active role from `.agent/session/active-role.txt`, parses `may_create`/`may_modify` patterns from the role YAML, and exits non-zero to block the write if the target file is out of scope. |
-| **post-generate check** | After generation | `post-generate.sh` re-runs the same role scope check against `git diff`, then runs lint, typecheck, and tests. Two hard-fail layers for the price of one. |
+| **PreToolUse hook** | Before each file write | `scope-check.sh` is **fail-closed**: if no role is declared in `.agent/session/active-role.txt`, all source writes are blocked. With a role declared, it parses `may_create`/`may_modify` from the role YAML and exits non-zero to block out-of-scope writes. `.agent/**` is always writable so the model can bootstrap itself. |
+| **post-generate check** | After generation | `post-generate.sh` re-runs the role scope check against `git diff`, enforces `max_lines_per_file` and `new_packages` policy from `conventions.yaml`, applies persona gates (see below), then runs lint, typecheck, tests, and the coverage gate. |
 | **CI / git hook** | On commit / push | Wire `post-generate.sh` and `security-audit.sh` as a pre-commit hook or CI step. Hard gate before code lands. |
 
 `post-generate.sh` is stack-aware — it reads `stack.yaml` and runs the right linter, typechecker, and test runner for your project automatically. For example, a TypeScript/Jest project gets:
@@ -325,6 +326,26 @@ npx eslint <changed .ts files>
 npx tsc --noEmit
 npx jest --findRelatedTests <changed files>
 ```
+
+### Conventions enforcement
+
+`post-generate.sh` makes `conventions.yaml` load-bearing — not just documentation:
+
+| Convention key | Enforcement |
+|---|---|
+| `module_size.max_lines_per_file` | Hard-fails if any changed file under `src/` exceeds the declared limit. Default 300 if key is absent. |
+| `dependencies.new_packages: requires_human_approval` | Hard-fails if `package.json` is in the diff and no `approv` entry exists in the last 10 lines of `decisions.jsonl`. |
+| `testing.min_coverage` | Runs the test suite with coverage (`jest --coverage`, `pytest --cov`, `go test -cover`, `phpunit --coverage-text`, JaCoCo CSV) and hard-fails if statement coverage is below the declared threshold. Skipped for `vibecoder` persona. |
+
+### Persona gates in checks
+
+Personas now affect check behaviour in addition to guidance text:
+
+| Persona | Additional check gate |
+|---|---|
+| `architect` | Hard-fails when >3 files changed and the last line of `decisions.jsonl` has no `"task"` key — forces a logged decision before large changes land. |
+| `vibecoder` | Coverage gate is skipped entirely. |
+| `lead` / `pragmatist` | No additional gates beyond the defaults. |
 
 ### Debugger workflow
 
