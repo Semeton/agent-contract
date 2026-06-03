@@ -249,15 +249,37 @@ async function suiteInit() {
   assert("init: CLAUDE.md shim references boot sequence", claudeMd.includes("Boot Sequence"));
   assert("init: CLAUDE.md shim references handoff protocol", claudeMd.includes("Session Handoff Protocol"));
 
+  // new hook scripts
+  for (const rel of [".agent/checks/write-handoff.sh", ".agent/checks/scope-check.sh"]) {
+    assert(`init creates ${rel}`, fs.existsSync(path.join(target, rel)));
+  }
+
   // checks must be executable
   for (const rel of [
     ".agent/checks/pre-generate.sh",
     ".agent/checks/post-generate.sh",
     ".agent/checks/debug-scope.sh",
+    ".agent/checks/write-handoff.sh",
+    ".agent/checks/scope-check.sh",
   ]) {
     const mode = fs.statSync(path.join(target, rel)).mode & 0o111;
     assert(`${rel} is executable`, mode !== 0, mode);
   }
+
+  // .claude/settings.json is created with PreToolUse and Stop hooks
+  const settingsPath = path.join(target, ".claude/settings.json");
+  assert("init creates .claude/settings.json", fs.existsSync(settingsPath));
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert("init: settings.json has PreToolUse hook", Array.isArray(settings.hooks && settings.hooks.PreToolUse));
+  assert("init: settings.json has Stop hook", Array.isArray(settings.hooks && settings.hooks.Stop));
+  assert(
+    "init: PreToolUse hook references scope-check.sh",
+    (settings.hooks.PreToolUse || []).some((e) => e.hooks && e.hooks.some((h) => h.command && h.command.includes("scope-check.sh")))
+  );
+  assert(
+    "init: Stop hook references write-handoff.sh",
+    (settings.hooks.Stop || []).some((e) => e.hooks && e.hooks.some((h) => h.command && h.command.includes("write-handoff.sh")))
+  );
 
   // re-run is idempotent — manifest content unchanged
   const manifestBefore = fs.readFileSync(path.join(target, ".agent/manifest.yaml"), "utf8");
@@ -563,6 +585,18 @@ function runScript(scriptPath, args) {
   }
 }
 
+function runScriptWithInput(scriptPath, args, input) {
+  try {
+    execSync(`bash ${scriptPath} ${args.map((a) => `'${a}'`).join(" ")}`, {
+      stdio: "pipe",
+      input,
+    });
+    return 0;
+  } catch (e) {
+    return e.status || 1;
+  }
+}
+
 async function suiteUpdate() {
   process.stdout.write("\n[update]\n");
 
@@ -709,6 +743,135 @@ async function suiteMap() {
   assert("map: existing map lists nestjs dep", eMap.includes("@nestjs/core"));
 }
 
+async function suiteHooks() {
+  process.stdout.write("\n[hooks]\n");
+
+  const target = fixture("hooks-target", {
+    "package.json": JSON.stringify({ name: "t" }),
+  });
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+
+  const scopeCheck = path.join(target, ".agent/checks/scope-check.sh");
+  const writeHandoff = path.join(target, ".agent/checks/write-handoff.sh");
+  const sessionDir = path.join(target, ".agent/session");
+
+  // scope-check: no active-role.txt → always passes (exit 0)
+  const noRoleCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/foo.ts"), content: "x" } })
+  );
+  assert("scope-check: exits 0 when no active-role.txt", noRoleCode === 0, noRoleCode);
+
+  // scope-check: active role "tester" (may_create/modify: tests/**)
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "tester\n");
+
+  const inScopeCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "tests/foo.test.ts"), content: "x" } })
+  );
+  assert("scope-check: exits 0 when file is in role scope", inScopeCode === 0, inScopeCode);
+
+  const outOfScopeCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/service.ts"), content: "x" } })
+  );
+  assert("scope-check: exits 1 when file is outside role scope", outOfScopeCode === 1, outOfScopeCode);
+
+  // scope-check: unknown role file → passes (no YAML to parse → no restrictions)
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "nonexistent-role\n");
+  const unknownRoleCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/anything.ts"), content: "x" } })
+  );
+  assert("scope-check: exits 0 when role YAML not found", unknownRoleCode === 0, unknownRoleCode);
+
+  // scope-check: always allows writes to .agent/ infrastructure regardless of role
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "tester\n");
+  const agentInfraCode = runScriptWithInput(
+    scopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/memory/decisions.jsonl"), content: "x" } })
+  );
+  assert("scope-check: exits 0 for .agent/ infrastructure writes", agentInfraCode === 0, agentInfraCode);
+
+  // write-handoff: skips write when no git changes (avoids noise on trivial turns)
+  // In a non-git temp dir, CHANGED stays empty → script exits 0 without creating a file
+  const memFilesBefore = fs.readdirSync(path.join(target, ".agent/memory"))
+    .filter((f) => f.startsWith("handoff-done-") && f.endsWith(".md")).length;
+  runScript(writeHandoff, []);
+  const memFilesAfterNoChange = fs.readdirSync(path.join(target, ".agent/memory"))
+    .filter((f) => f.startsWith("handoff-done-") && f.endsWith(".md")).length;
+  assert("write-handoff: skips write when no git changes", memFilesAfterNoChange === memFilesBefore, memFilesAfterNoChange);
+
+  // write-handoff: creates a handoff file in .agent/memory/ when there ARE changes
+  // Simulate by initialising a git repo and making an uncommitted change
+  const gitTarget = fixture("hooks-git-target", { "package.json": JSON.stringify({ name: "t" }) });
+  execSync("git init && git add . && git commit -m init --allow-empty-message", { cwd: gitTarget, stdio: "pipe" });
+  await captureStdout(async () => init({ cwd: gitTarget, flags: {} }));
+  // Stage a new file so git diff HEAD reports a change
+  fs.mkdirSync(path.join(gitTarget, "src"), { recursive: true });
+  fs.writeFileSync(path.join(gitTarget, "src/new.ts"), "export const x = 1;\n");
+  execSync("git add src/new.ts", { cwd: gitTarget, stdio: "pipe" });
+  const gitWriteHandoff = path.join(gitTarget, ".agent/checks/write-handoff.sh");
+  const gitSessionDir = path.join(gitTarget, ".agent/session");
+  fs.mkdirSync(gitSessionDir, { recursive: true });
+  fs.writeFileSync(path.join(gitSessionDir, "active-role.txt"), "generator\n");
+  runScript(gitWriteHandoff, []);
+  const memFiles = fs.readdirSync(path.join(gitTarget, ".agent/memory"))
+    .filter((f) => f.startsWith("handoff-done-") && f.endsWith(".md"));
+  assert("write-handoff: creates handoff file when changes exist", memFiles.length > 0, memFiles);
+
+  // write-handoff: handoff file contains role and resume prompt
+  const handoffContent = fs.readFileSync(path.join(gitTarget, ".agent/memory", memFiles[0]), "utf8");
+  assert("write-handoff: handoff file contains role", handoffContent.includes("generator"), handoffContent.slice(0, 200));
+  assert("write-handoff: handoff file contains resume prompt", handoffContent.includes("Resume Prompt"), handoffContent.slice(0, 400));
+  assert(
+    "write-handoff: filename has second-granularity timestamp",
+    /handoff-done-\d{4}-\d{2}-\d{2}-\d{6}\.md/.test(memFiles[0]),
+    memFiles[0]
+  );
+
+  // scope-check: quoted patterns (YAML emitter quotes strings starting with *) are stripped
+  const quotedRoleDir = path.join(gitTarget, ".agent/roles");
+  fs.writeFileSync(path.join(quotedRoleDir, "custom.yaml"), [
+    "schema: agent-contract/v1",
+    "role: custom",
+    "scope:",
+    "  may_create:",
+    '  - "**/utils/**"',
+    "  may_modify: []",
+    "  may_delete: []",
+  ].join("\n") + "\n");
+  const gitScopeCheck = path.join(gitTarget, ".agent/checks/scope-check.sh");
+  fs.writeFileSync(path.join(gitSessionDir, "active-role.txt"), "custom\n");
+  const quotedInScope = runScriptWithInput(
+    gitScopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(gitTarget, "src/utils/helper.ts"), content: "x" } })
+  );
+  assert("scope-check: quoted pattern matches correctly after stripping quotes", quotedInScope === 0, quotedInScope);
+  const quotedOutOfScope = runScriptWithInput(
+    gitScopeCheck, [],
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(gitTarget, "src/service.ts"), content: "x" } })
+  );
+  assert("scope-check: quoted pattern blocks files outside scope", quotedOutOfScope === 1, quotedOutOfScope);
+
+  // .agent/session/.gitignore created by init
+  assert(
+    "init creates .agent/session/.gitignore",
+    fs.existsSync(path.join(target, ".agent/session/.gitignore"))
+  );
+  const sessionGitignore = fs.readFileSync(path.join(target, ".agent/session/.gitignore"), "utf8");
+  assert(".agent/session/.gitignore ignores everything", sessionGitignore.trim() === "*");
+
+  // installClaudeHooks is idempotent — re-running init does not duplicate hooks
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+  const settings2 = JSON.parse(fs.readFileSync(path.join(target, ".claude/settings.json"), "utf8"));
+  const scopeHookCount = (settings2.hooks.PreToolUse || [])
+    .flatMap((e) => e.hooks || [])
+    .filter((h) => h.command && h.command.includes("scope-check.sh")).length;
+  assert("hooks install: idempotent (scope-check not duplicated)", scopeHookCount === 1, scopeHookCount);
+}
+
 async function suiteVersion() {
   process.stdout.write("\n[version]\n");
 
@@ -767,6 +930,7 @@ async function suiteVersion() {
     await suiteUpdate();
     await suiteTokens();
     await suiteMap();
+    await suiteHooks();
     await suiteVersion();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
