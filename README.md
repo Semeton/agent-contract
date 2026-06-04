@@ -71,7 +71,7 @@ agent-contract init --cwd ../other-repo
 
 ### Update
 
-Refresh roles, checks, templates, stack detection, and the codebase map — leave `conventions.yaml` and `manifest.yaml` untouched:
+Always refreshes: `stack.yaml`, `codebase-map.md`, and all check scripts. Leaves `conventions.yaml`, `manifest.yaml`, and `config.yaml` untouched. Roles and templates are preserved by default — overwrite them with `--force`:
 
 ```bash
 # Check for a newer version of agent-contract, install it, then update the project
@@ -107,7 +107,8 @@ Dispatch a role against a task using the configured AI provider:
 # Auto-detect provider, run generator role
 agent-contract run --role generator --task "add a POST /users endpoint"
 
-# Pass a structured task spec file
+# Pass a structured task spec file (must be JSON with these keys):
+# { "feature_name": "...", "input_shape": "...", "output_shape": "...", "error_cases": [] }
 agent-contract run --role debugger --spec ./task.json
 
 # Use a specific provider
@@ -185,8 +186,8 @@ For greenfield projects (fewer than 5 source files), the map notes it's a new co
 A handoff note is written:
 
 - **Automatically by the Stop hook** — the Claude Code `Stop` hook runs `write-handoff.sh` after every agent turn that produces git changes. The note is saved to `.agent/memory/handoff-done-{timestamp}.md` with the active role, changed files, and last 5 decisions. No model cooperation required; turns with no changes are silently skipped.
-- **At task completion** — after every successful `agent-contract run`, a note is saved with the role, task, token stats, and last 5 decisions.
-- **At 85% context window** — a banner is shown and a second note is saved if context is running low.
+- **At task completion** — after every successful `agent-contract run`, a note is saved to `.agent/memory/handoff-done-{timestamp}.md` with the role, task, token stats, and last 5 decisions.
+- **At 85% context window** — a banner is shown and a second note is saved to `.agent/memory/handoff-{timestamp}.md` (no `-done-` suffix). The boot sequence loads both formats since it matches `handoff-*.md`.
 - **By the agent directly** — the shim instructs agents (Claude Code, Cursor, etc.) to fill in `.agent/templates/handoff.md` and write it to `.agent/memory/` when a task is done, then tell you to start a fresh session.
 
 The boot sequence picks up the most recent handoff automatically, so the next session starts with full context.
@@ -220,7 +221,8 @@ The handoff note contains the current role, task, token stats, the last 5 entrie
 
 | Model | Limit |
 |---|---|
-| claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
+| claude-opus-4-8 / claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
+| claude-3-5-sonnet / claude-3-opus / claude-3-sonnet / claude-3-haiku | 200,000 |
 | gpt-4o / gpt-4o-mini / gpt-4-turbo | 128,000 |
 | gpt-3.5-turbo | 16,000 |
 | claude-code (CLI, estimated) | 200,000 |
@@ -257,6 +259,8 @@ Samples up to 20 source files, infers your existing conventions, and writes a dr
 ```bash
 agent-contract init --learn
 ```
+
+`--learn` runs as part of `init`, so it also writes the full scaffold on first use. On an already-initialized repo the init pass is idempotent (existing files are skipped), so re-running `init --learn` is safe.
 
 Infers: paradigm (OOP vs functional), error style, file naming convention, test placement pattern.
 
@@ -318,8 +322,8 @@ Defaults to **hard-fail**: scope violations exit non-zero. Enforcement runs at t
 | Layer | When | Mechanism |
 |---|---|---|
 | **PreToolUse hook** | Before each file write | `scope-check.sh` is **fail-closed**: if no role is declared in `.agent/session/active-role.txt`, all source writes are blocked. With a role declared, it parses `may_create`/`may_modify` from the role YAML and exits non-zero to block out-of-scope writes. `.agent/**` is always writable so the model can bootstrap itself. |
-| **post-generate check** | After generation | `post-generate.sh` re-runs the role scope check against `git diff`, enforces `max_lines_per_file` and `new_packages` policy from `conventions.yaml`, applies persona gates (see below), then runs lint, typecheck, tests, and the coverage gate. |
-| **CI / git hook** | On commit / push | Wire `post-generate.sh` and `security-audit.sh` as a pre-commit hook or CI step. Hard gate before code lands. |
+| **post-generate check** | After `agent-contract run` | `post-generate.sh` re-runs the role scope check against `git diff`, enforces `max_lines_per_file` and `new_packages` policy from `conventions.yaml`, applies persona gates (see below), then runs lint, typecheck, tests, and the coverage gate. Called automatically by `run` for all roles. |
+| **CI / git hook** | On commit / push | `debug-scope.sh` and `security-audit.sh` are **not** called by `agent-contract run` — wire them as a pre-commit hook or CI step. Hard gate before code lands. |
 
 `post-generate.sh` is stack-aware — it reads `stack.yaml` and runs the right linter, typechecker, and test runner for your project automatically. For example, a TypeScript/Jest project gets:
 
