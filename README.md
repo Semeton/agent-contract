@@ -178,6 +178,8 @@ tests/
 
 For greenfield projects (fewer than 5 source files), the map notes it's a new codebase and instructs the agent to architect from scratch.
 
+`pre-generate.sh` also warns when `codebase-map.md` predates the last git commit — a signal that the map is stale and `agent-contract update` should be run before generating code.
+
 ### 3. Handoff notes
 
 A handoff note is written:
@@ -218,7 +220,7 @@ The handoff note contains the current role, task, token stats, the last 5 entrie
 
 | Model | Limit |
 |---|---|
-| claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
+| claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
 | gpt-4o / gpt-4o-mini / gpt-4-turbo | 128,000 |
 | gpt-3.5-turbo | 16,000 |
 | claude-code (CLI, estimated) | 200,000 |
@@ -266,7 +268,7 @@ your-repo/
 │   ├── manifest.yaml             ← single entrypoint (persona, stack refs, enforcement policy)
 │   ├── stack.yaml                ← auto-generated; language/framework facts + shell commands
 │   ├── conventions.yaml          ← engineering rules (paradigm, tone, module size, DB policy…)
-│   ├── config.yaml               ← provider/model config
+│   ├── config.yaml               ← provider/model config (provider, model; env vars override)
 │   ├── roles/                    ← one YAML per role
 │   │   ├── generator.yaml
 │   │   ├── integrator.yaml

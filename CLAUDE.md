@@ -23,6 +23,8 @@ lib/
   commands/
     init.js                 ← orchestrates detect → write plan → execute
     detect.js               ← read-only detection (json or human output)
+    run.js                  ← dispatches role + task to a provider
+    update.js               ← selective refresh (roles, checks, map; leaves conventions)
   detect/
     index.js                ← detector pipeline + scoring
     detectors/
@@ -30,9 +32,17 @@ lib/
       php.js                ← Laravel, Symfony, ...
       python.js             ← Django, Flask, FastAPI
       go.js, rust.js, java.js, ruby.js, dotnet.js
+  learn/
+    index.js                ← --learn: samples source files, infers conventions draft
+  providers/
+    anthropic.js            ← Anthropic SDK provider (claude-opus-4-8 default)
+    openai.js               ← OpenAI SDK provider (gpt-4o default)
+    claude-code.js          ← claude CLI provider (Pro/Max, no API key)
+    echo.js                 ← dry-run echo provider
   util/
     yaml.js                 ← minimal hand-rolled YAML emitter (no js-yaml dep)
     fs.js                   ← idempotent file writer (create-only / merge-shim / overwrite)
+    hooks.js                ← idempotent .claude/settings.json hook installer
     templates.js            ← all emitted file contents live here
 test/
   smoke.js                  ← end-to-end test, gates `npm publish` via prepublishOnly
@@ -58,10 +68,9 @@ node bin/agent-contract.js init --cwd <path> [--dry-run|--force]
 
 ## Known gaps / future work
 
-1. `post-generate.sh` is stack-agnostic; should call `eslint`/`phpstan`/`pytest` based on `stack.yaml`.
-2. No `--learn` mode for legacy convention inference.
-3. No orchestrator — role YAMLs declare the contract, nothing dispatches against them yet.
-4. YAML emitter is one-way (emit only). If users start editing contract files we'll need to read them back; swap in `js-yaml` then.
+1. YAML emitter is one-way (emit only). If users start editing contract files we'll need to read them back; swap in `js-yaml` then.
+2. No orchestrator feedback loop — role YAMLs declare the contract, but `agent-contract run` dispatches a single turn rather than a multi-step loop with re-checking.
+3. `--learn` output (`conventions.draft.yaml`) is not auto-merged; the human must copy it into `conventions.yaml` manually.
 
 ## Publishing
 
