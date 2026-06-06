@@ -621,12 +621,12 @@ async function suiteUpdate() {
   const origManifest = fs.readFileSync(manifestPath, "utf8");
   fs.writeFileSync(manifestPath, origManifest + "\n# USER_MANIFEST_MARKER\n");
 
-  // Default update — preserves roles, templates, conventions, manifest
+  // Default update — roles are always refreshed from stack detection
   await captureStdout(async () => update({ cwd: target, flags: {} }));
 
-  // roles must be preserved
+  // roles must be refreshed (user edits are NOT preserved — roles are auto-generated)
   const genAfter = fs.readFileSync(genPath, "utf8");
-  assert("update: preserves user edits in role yaml by default", genAfter.includes("USER_ROLE_EDIT"), genAfter.slice(0, 80));
+  assert("update: always refreshes role yaml from detected stack", genAfter.includes("role: generator"), genAfter.slice(0, 80));
 
   // conventions.yaml must be untouched
   const convAfter = fs.readFileSync(convPath, "utf8");
@@ -837,6 +837,30 @@ async function suiteHooks() {
     /handoff-done-\d{4}-\d{2}-\d{2}-\d{6}\.md/.test(memFiles[0]),
     memFiles[0]
   );
+
+  // write-handoff: compaction — keeps only 5, archives the rest
+  {
+    const compactMemDir = path.join(gitTarget, ".agent/memory");
+    // Seed 7 fake handoff files (older than the one written above)
+    for (let i = 1; i <= 7; i++) {
+      const ts = `2020-01-0${i}-120000`;
+      fs.writeFileSync(
+        path.join(compactMemDir, `handoff-done-${ts}.md`),
+        `# Agent Handoff — ${ts}\n\n## Role\ngenerator\n\n## Files Changed\nfoo.ts\n\n## Last 5 Decisions\n{}\n\n## Resume Prompt\n\`\`\`\ntest\n\`\`\`\n`
+      );
+    }
+    runScript(gitWriteHandoff, []);
+    // Background compaction may need a moment to finish
+    await new Promise((r) => setTimeout(r, 400));
+    const remaining = fs.readdirSync(compactMemDir).filter((f) => f.startsWith("handoff-done-") && f.endsWith(".md"));
+    assert("write-handoff: compaction keeps at most 5 handoffs", remaining.length <= 5, remaining.length);
+    const archiveExists = fs.existsSync(path.join(compactMemDir, "handoff-archive.jsonl"));
+    assert("write-handoff: compaction writes handoff-archive.jsonl", archiveExists, null);
+    if (archiveExists) {
+      const archiveLine = fs.readFileSync(path.join(compactMemDir, "handoff-archive.jsonl"), "utf8").trim();
+      assert("write-handoff: archive entries are valid JSON", archiveLine.split("\n").every((l) => { try { JSON.parse(l); return true; } catch { return false; } }), archiveLine.slice(0, 200));
+    }
+  }
 
   // scope-check: quoted patterns (YAML emitter quotes strings starting with *) are stripped
   const quotedRoleDir = path.join(gitTarget, ".agent/roles");
