@@ -8,6 +8,7 @@ const { init } = require("../lib/commands/init");
 const { detect } = require("../lib/commands/detect");
 const { run } = require("../lib/commands/run");
 const { update } = require("../lib/commands/update");
+const { status } = require("../lib/commands/status");
 
 const PKG = require("../package.json");
 
@@ -16,6 +17,7 @@ const COMMANDS = {
   detect,
   run,
   update,
+  status,
 };
 
 function printHelp() {
@@ -31,6 +33,7 @@ function printHelp() {
       "  update    Refresh roles, checks, templates, and stack — leave conventions/manifest untouched",
       "  detect    Run stack detection only; print result to stdout (no writes)",
       "  run       Run a role against a task via the configured provider",
+      "  status    Show active role, last decisions, map freshness, and registered checks",
       "",
       "Flags (all commands):",
       "  --cwd <path>     Run against the given directory (default: process.cwd())",
@@ -46,9 +49,10 @@ function printHelp() {
       "                     nestjs-clean-architecture | laravel-service-pattern | none",
       "  --persona <name> Set the agent persona (default: pragmatist):",
       "                     pragmatist | architect | vibecoder | lead",
-      "  --learn          After init, sample existing source files and write a draft",
-      "                   conventions.yaml to .agent/conventions.draft.yaml for review.",
-      "                   Nothing is auto-applied — the draft is yours to edit and merge.",
+      "  --learn          After init, sample existing source files and infer a draft",
+      "                   conventions.yaml → .agent/conventions.draft.yaml.",
+      "  --learn --merge  Same as --learn, but apply the draft directly to conventions.yaml",
+      "                   instead of writing a separate draft file.",
       "",
       "Flags (update):",
       "  --persona <name>       Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
@@ -62,10 +66,10 @@ function printHelp() {
       "  --provider <p>   Override provider (see below)",
       "",
       "Providers (auto-detected in order if --provider is not set):",
+      "  claude-code  Uses your Claude Pro/Max subscription via the installed `claude` CLI. (default)",
+      "               No API key needed. Install Claude Code at claude.ai/code.",
       "  anthropic    Calls api.anthropic.com — requires ANTHROPIC_API_KEY",
       "  openai       Calls api.openai.com   — requires OPENAI_API_KEY",
-      "  claude-code  Uses your Claude Pro/Max subscription via the installed `claude` CLI.",
-      "               No API key needed. Install Claude Code at claude.ai/code.",
       "  echo         Dry-run: prints the assembled prompt, calls nothing.",
       "",
       "Environment variables (run):",
