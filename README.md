@@ -7,7 +7,7 @@ Most "agent guidance" today is markdown prose: `CLAUDE.md`, `AGENTS.md`, `.curso
 One command drops a `.agent/` scaffold into your repo:
 
 - **Stack auto-detection** — language, framework, ORM, DB, test runner, lint, formatter across 14 stacks.
-- **Roles as scoped contracts** — generator, integrator, tester, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete. Scopes are generated from detected framework: a Laravel init gets `app/**, config/**, routes/**`; a Rails init gets `app/**, config/**, db/**`; a NestJS init gets `src/**`. No more hardcoded `src/**` for every stack.
+- **Roles as scoped contracts** — generator, integrator, tester, reviewer, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete. Scopes are generated from detected framework: a Laravel init gets `app/**, config/**, routes/**`; a Rails init gets `app/**, config/**, db/**`; a NestJS init gets `src/**`. No more hardcoded `src/**` for every stack. Roles are always regenerated from the detected stack on `init` and `update` — they are declarative output, not user-edited config.
 - **Checks as hard gates** — pre-/post-generate, debug-scope, and security-audit scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
 - **Per-stack linting/testing in checks** — `post-generate.sh` calls the right linter, typechecker, and test runner for your stack automatically.
 - **Conventions enforcement** — `post-generate.sh` reads `max_lines_per_file` and `new_packages` policy directly from `conventions.yaml`. If a file exceeds the declared limit or `package.json` changes without a logged approval, the check hard-fails.
@@ -15,7 +15,7 @@ One command drops a `.agent/` scaffold into your repo:
 - **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`. Persona now affects check behaviour, not just guidance text: `architect` hard-fails when >3 files change with no decision logged; `vibecoder` skips the coverage gate entirely.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
-- **Codebase memory map** — on every `init` and `update`, scans the repo and writes `.agent/memory/codebase-map.md`: a structured index of your directory tree, entry points, key config files, and top-level dependencies. Agents consult the map before reading source files, saving tokens on every session.
+- **Codebase memory map** — on every `init` and `update`, scans the repo and writes `.agent/memory/codebase-map.md`: a structured index of your directory tree (with filenames at depth ≤ 2), entry points, key config files, and top-level dependencies. Agents consult the map before reading source files — they can navigate directly to the right file without scanning. Crowded directories (>20 source files) are annotated with a count instead of an exhaustive list so the map stays bounded on large projects.
 - **Session handoff protocol** — the contract shim instructs agents to write a handoff note at task completion and load the most recent one at session start. Context is never silently lost across sessions.
 - **Token management** — tracks context window usage per run. Warns at 70%, writes a handoff note at 85% and on every successful task completion.
 - **Decision log instead of chat history** — `memory/decisions.jsonl` carries context across models, sessions, and tools.
@@ -71,7 +71,7 @@ agent-contract init --cwd ../other-repo
 
 ### Update
 
-Always refreshes: `stack.yaml`, `codebase-map.md`, and all check scripts. Leaves `conventions.yaml`, `manifest.yaml`, and `config.yaml` untouched. Roles and templates are preserved by default — overwrite them with `--force`:
+Always refreshes: `stack.yaml`, `codebase-map.md`, all check scripts, and all role YAMLs (roles are declarative output derived from stack detection, not user-edited config). Leaves `conventions.yaml`, `manifest.yaml`, `config.yaml`, and templates untouched — overwrite templates with `--force`:
 
 ```bash
 # Check for a newer version of agent-contract, install it, then update the project
@@ -157,9 +157,20 @@ Framework: nestjs
 src/
   modules/
     users/
+      users.controller.ts
+      users.service.ts
+      users.module.ts
     orders/
+      orders.controller.ts
+      orders.service.ts
+      orders.module.ts
   common/
+    filters/
+    guards/
+  main.ts
+  app.module.ts
 tests/
+  app.e2e-spec.ts
 
 ## Entry Points
 - src/main.ts
@@ -177,6 +188,8 @@ tests/
 ...
 ```
 
+Directories with more than 20 source files are annotated with a count instead of a full listing (e.g. `Controllers/  (42 files)`) so the map stays bounded on large codebases.
+
 For greenfield projects (fewer than 5 source files), the map notes it's a new codebase and instructs the agent to architect from scratch.
 
 `pre-generate.sh` also warns when `codebase-map.md` predates the last git commit — a signal that the map is stale and `agent-contract update` should be run before generating code.
@@ -191,6 +204,8 @@ A handoff note is written:
 - **By the agent directly** — the shim instructs agents (Claude Code, Cursor, etc.) to fill in `.agent/templates/handoff.md` and write it to `.agent/memory/` when a task is done, then tell you to start a fresh session.
 
 The boot sequence picks up the most recent handoff automatically, so the next session starts with full context.
+
+**Compaction:** `write-handoff.sh` keeps only the 5 most recent handoff files. Older ones are archived to `.agent/memory/handoff-archive.jsonl` (one JSON entry per file with `ts`, `role`, and `files` fields) and deleted. The archive runs in the background so it never adds latency to the session.
 
 ## Token management
 
@@ -273,10 +288,11 @@ your-repo/
 │   ├── stack.yaml                ← auto-generated; language/framework facts + shell commands
 │   ├── conventions.yaml          ← engineering rules (paradigm, tone, module size, DB policy…)
 │   ├── config.yaml               ← provider/model config (provider, model; env vars override)
-│   ├── roles/                    ← one YAML per role
+│   ├── roles/                    ← one YAML per role (always regenerated from stack detection)
 │   │   ├── generator.yaml
 │   │   ├── integrator.yaml
 │   │   ├── tester.yaml
+│   │   ├── reviewer.yaml         ← convention compliance gate between tester and documenter
 │   │   ├── debugger.yaml
 │   │   ├── documenter.yaml
 │   │   └── security.yaml
@@ -295,7 +311,8 @@ your-repo/
 │   ├── memory/
 │   │   ├── decisions.jsonl                    ← append-only decision log
 │   │   ├── codebase-map.md                    ← auto-generated repo index (refreshed on update)
-│   │   └── handoff-done-{timestamp}.md        ← written after every completed task
+│   │   ├── handoff-done-{timestamp}.md        ← written after every completed task
+│   │   └── handoff-archive.jsonl              ← compacted old handoffs (keeps 5 most recent)
 │   └── session/
 │       ├── .gitignore                         ← excludes session state from git
 │       └── active-role.txt                    ← written at boot; read by scope-check.sh
