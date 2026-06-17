@@ -11,7 +11,8 @@ One command drops a `.agent/` scaffold into your repo:
 - **Checks as hard gates** — pre-/post-generate, debug-scope, and security-audit scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
 - **Per-stack linting/testing in checks** — `post-generate.sh` calls the right linter, typechecker, and test runner for your stack automatically.
 - **Conventions enforcement** — `post-generate.sh` reads `max_lines_per_file` and `new_packages` policy directly from `conventions.yaml`. If a file exceeds the declared limit or `package.json` changes without a logged approval, the check hard-fails.
-- **Claude Code hooks** — `init` writes `.claude/settings.json` with two hooks: a `PreToolUse` hook that blocks out-of-scope file writes _before_ they happen, and a `Stop` hook that auto-writes a handoff note after every turn that produces git changes. No model cooperation required.
+- **Claude Code hooks** — `init` writes `.claude/settings.json` with three hooks: a `PreToolUse` hook on the file tools that blocks out-of-scope writes _before_ they happen, a `PreToolUse` hook on `Bash` that stops commands from tampering with contract-controlled files (the self-escape vector), and a `Stop` hook that auto-writes a handoff note after every turn that produces git changes. No model cooperation required.
+- **Self-protecting & fail-closed** — the agent cannot rewrite its own role, widen a role's scope, or edit the guard scripts: `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt`, and `.claude/settings*` are off-limits in-session and changed only out-of-band. A role with an empty scope is read-only, not unrestricted. See [Enforcement model](#enforcement-model).
 - **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`. Persona now affects check behaviour, not just guidance text: `architect` hard-fails when >3 files change with no decision logged; `vibecoder` skips the coverage gate entirely.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
@@ -138,8 +139,7 @@ Every shim file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`) now contains a mandat
 2. Read `.agent/manifest.yaml` to load the full contract.
 3. Read `.agent/memory/codebase-map.md` — use this as the index. Do not read raw source files before consulting the map.
 4. Load the relevant role from `.agent/roles/<role>.yaml`.
-5. Run `.agent/checks/pre-generate.sh` before generating any code.
-6. Write your active role name (e.g. `generator`) to `.agent/session/active-role.txt`. This enables the scope-enforcement hook.
+5. Declare the role by running `.agent/checks/pre-generate.sh <task-spec.json> <role>` before generating any code — this validates the spec **and** writes `.agent/session/active-role.txt`, enabling the scope-enforcement hooks. `active-role.txt` is contract-controlled, so hand-editing it is blocked; running `pre-generate.sh` (or a dispatcher) is the sanctioned way to set the role.
 
 The contract is declared **non-optional** — it applies to every session, every task, every model, without needing to be mentioned in the prompt.
 
@@ -298,10 +298,12 @@ your-repo/
 │   │   └── security.yaml
 │   ├── checks/                   ← executable gates (stack-aware)
 │   │   ├── pre-generate.sh       ← validates task spec before generation
-│   │   ├── post-generate.sh      ← lint, typecheck, tests, role scope check
+│   │   ├── post-generate.sh      ← lint, typecheck, tests, role scope check (diff/outcome)
 │   │   ├── debug-scope.sh        ← enforces fix-not-refactor
 │   │   ├── security-audit.sh     ← credentials, insecure patterns, vulnerable deps
-│   │   ├── scope-check.sh        ← PreToolUse hook: blocks out-of-scope writes
+│   │   ├── scope-lib.sh          ← shared scope engine (sourced by the three guards below)
+│   │   ├── scope-check.sh        ← PreToolUse hook (file tools): blocks out-of-scope writes
+│   │   ├── bash-write-guard.sh   ← PreToolUse hook (Bash): blocks tampering with contract files
 │   │   └── write-handoff.sh      ← Stop hook: auto-writes handoff on git changes
 │   ├── templates/
 │   │   ├── commit.txt
@@ -315,9 +317,9 @@ your-repo/
 │   │   └── handoff-archive.jsonl              ← compacted old handoffs (keeps 5 most recent)
 │   └── session/
 │       ├── .gitignore                         ← excludes session state from git
-│       └── active-role.txt                    ← written at boot; read by scope-check.sh
+│       └── active-role.txt                    ← set by pre-generate.sh/dispatcher; read by the guards (contract-controlled)
 ├── .claude/
-│   └── settings.json                          ← Claude Code hooks (PreToolUse + Stop)
+│   └── settings.json                          ← Claude Code hooks (PreToolUse ×2 + Stop)
 ├── CLAUDE.md                                  ← shim with boot sequence → manifest
 ├── AGENTS.md                                  ← shim with boot sequence → manifest
 ├── .cursorrules                               ← shim with boot sequence → manifest
@@ -334,13 +336,51 @@ Three properties, in order:
 
 ### Enforcement model
 
-Defaults to **hard-fail**: scope violations exit non-zero. Enforcement runs at three layers:
+Defaults to **hard-fail**: scope violations exit non-zero. The guiding principle is
+**enforce on outcomes, not just actions** — checking the resulting `git diff` catches a
+write no matter *how* it was made, while the per-tool hooks block the obvious cases early.
+Enforcement runs at four layers:
 
 | Layer | When | Mechanism |
 |---|---|---|
-| **PreToolUse hook** | Before each file write | `scope-check.sh` is **fail-closed**: if no role is declared in `.agent/session/active-role.txt`, all source writes are blocked. With a role declared, it parses `may_create`/`may_modify` from the role YAML and exits non-zero to block out-of-scope writes. `.agent/**` is always writable so the model can bootstrap itself. |
-| **post-generate check** | After `agent-contract run` | `post-generate.sh` re-runs the role scope check against `git diff`, enforces `max_lines_per_file` and `new_packages` policy from `conventions.yaml`, applies persona gates (see below), then runs lint, typecheck, tests, and the coverage gate. Called automatically by `run` for all roles. |
-| **CI / git hook** | On commit / push | `debug-scope.sh` and `security-audit.sh` are **not** called by `agent-contract run` — wire them as a pre-commit hook or CI step. Hard gate before code lands. |
+| **PreToolUse — file tools** | Before each `Write`/`Edit`/`MultiEdit` | `scope-check.sh` is **fail-closed**: no role declared → all source writes blocked; declared role with no `roles/<role>.yaml` → blocked; a role whose `may_create`/`may_modify` are empty is **read-only** (e.g. `reviewer`, `security`) and may not write source. Otherwise it matches the target against the role's globs and blocks anything outside. |
+| **PreToolUse — Bash** | Before each `Bash` command | `bash-write-guard.sh` closes the hole that file-tool checks can't see: a Bash command (`echo > …`, `sed -i`, `tee`, `rm`, `cp`/`mv`) that writes to a **contract-controlled** file. High-precision and conservative — it only blocks writes *adjacent* to a protected path, so reads like `cat .agent/roles/x` are untouched. General source writes via Bash are left to the outcome layer. |
+| **post-generate — outcome check** | After `agent-contract run`, or as a pre-commit / CI gate | `post-generate.sh` re-runs the role scope check against `git diff` (authoritative: independent of write method), enforces `max_lines_per_file` and `new_packages` policy, applies persona gates, then runs lint, typecheck, tests, and the coverage gate. Empty-scope roles are fail-closed here too. |
+| **CI / git hook** | On commit / push | `debug-scope.sh` and `security-audit.sh` are **not** called by `agent-contract run` — wire them (and `post-generate.sh`) as a pre-commit hook or CI step. Hard gate before code lands. |
+
+#### Contract-controlled files (the guards protect themselves)
+
+Earlier versions let the agent write anything under `.agent/**` — including its own role
+file, the role definitions, and the guard scripts. That let a session **escape its own
+scope**: rewrite `active-role.txt` to switch roles mid-task, widen a role's globs, or edit
+the checks. These paths are now **off-limits to the agent** at every layer (both PreToolUse
+hooks block them; the outcome check leaves them to `agent-contract update`):
+
+- `.agent/session/active-role.txt`
+- `.agent/roles/**`
+- `.agent/checks/**`
+- `.claude/settings.json` / `.claude/settings.local.json`
+
+Change these **out-of-band** — a human edit or `agent-contract update` — never from inside an
+agent session. The rest of `.agent/**` (memory, decisions, handoffs) stays writable so the
+model can record its work.
+
+#### What this does and does not guarantee
+
+- **Guaranteed (deterministic):** the *blast radius* of agent writes. Contract files can't be
+  self-modified; out-of-scope and read-only-role writes are blocked; the outcome check binds
+  the final diff to the active role regardless of how files were written.
+- **Best-effort:** the Bash guard is a high-precision speed bump, not an airtight parser —
+  Bash has unlimited ways to mutate a file. The authoritative backstop for *source* writes is
+  the `post-generate.sh` diff check; wire it as a pre-commit/CI gate to make it binding.
+- **Not enforceable by the contract alone (needs a human/dispatcher):** that the *correct*
+  role was chosen for a task, and that a logged decision is *sound*. The contract constrains
+  what a role may do; it can't judge whether the right role was picked. For the strongest
+  guarantee, have the entry point (dispatcher, ticket, or human) write `active-role.txt`
+  rather than letting the agent self-select.
+
+> **Upgrading an existing repo:** run `agent-contract update` to regenerate the check scripts
+> and add the new Bash hook to `.claude/settings.json`. Both are idempotent.
 
 `post-generate.sh` is stack-aware — it reads `stack.yaml` and runs the right linter, typechecker, and test runner for your project automatically. For example, a TypeScript/Jest project gets:
 

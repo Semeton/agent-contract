@@ -250,7 +250,12 @@ async function suiteInit() {
   assert("init: CLAUDE.md shim references handoff protocol", claudeMd.includes("Session Handoff Protocol"));
 
   // new hook scripts
-  for (const rel of [".agent/checks/write-handoff.sh", ".agent/checks/scope-check.sh"]) {
+  for (const rel of [
+    ".agent/checks/write-handoff.sh",
+    ".agent/checks/scope-lib.sh",
+    ".agent/checks/scope-check.sh",
+    ".agent/checks/bash-write-guard.sh",
+  ]) {
     assert(`init creates ${rel}`, fs.existsSync(path.join(target, rel)));
   }
 
@@ -260,7 +265,9 @@ async function suiteInit() {
     ".agent/checks/post-generate.sh",
     ".agent/checks/debug-scope.sh",
     ".agent/checks/write-handoff.sh",
+    ".agent/checks/scope-lib.sh",
     ".agent/checks/scope-check.sh",
+    ".agent/checks/bash-write-guard.sh",
   ]) {
     const mode = fs.statSync(path.join(target, rel)).mode & 0o111;
     assert(`${rel} is executable`, mode !== 0, mode);
@@ -275,6 +282,10 @@ async function suiteInit() {
   assert(
     "init: PreToolUse hook references scope-check.sh",
     (settings.hooks.PreToolUse || []).some((e) => e.hooks && e.hooks.some((h) => h.command && h.command.includes("scope-check.sh")))
+  );
+  assert(
+    "init: PreToolUse hook references bash-write-guard.sh on Bash matcher",
+    (settings.hooks.PreToolUse || []).some((e) => e.matcher === "Bash" && e.hooks && e.hooks.some((h) => h.command && h.command.includes("bash-write-guard.sh")))
   );
   assert(
     "init: Stop hook references write-handoff.sh",
@@ -762,12 +773,12 @@ async function suiteHooks() {
   );
   assert("scope-check: exits 1 when no active-role.txt (fail-closed)", noRoleCode === 1, noRoleCode);
 
-  // scope-check: no active-role.txt → .agent/ infra writes always pass
+  // scope-check: no active-role.txt → writable .agent/ infra (memory/decisions/handoffs) still passes
   const noRoleAgentCode = runScriptWithInput(
     scopeCheck, [],
-    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/session/active-role.txt"), content: "generator" } })
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/memory/notes.md"), content: "hi" } })
   );
-  assert("scope-check: exits 0 for .agent/ writes when no active-role.txt", noRoleAgentCode === 0, noRoleAgentCode);
+  assert("scope-check: exits 0 for writable .agent/ infra when no active-role.txt", noRoleAgentCode === 0, noRoleAgentCode);
 
   // scope-check: active role "tester" (may_create/modify: tests/**)
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -785,13 +796,13 @@ async function suiteHooks() {
   );
   assert("scope-check: exits 1 when file is outside role scope", outOfScopeCode === 1, outOfScopeCode);
 
-  // scope-check: unknown role file → passes (no YAML to parse → no restrictions)
+  // scope-check: unknown role file → fail-closed (declared role has no YAML → block source writes)
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "nonexistent-role\n");
   const unknownRoleCode = runScriptWithInput(
     scopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/anything.ts"), content: "x" } })
   );
-  assert("scope-check: exits 0 when role YAML not found", unknownRoleCode === 0, unknownRoleCode);
+  assert("scope-check: exits 1 when role YAML not found (fail-closed)", unknownRoleCode === 1, unknownRoleCode);
 
   // scope-check: always allows writes to .agent/ infrastructure regardless of role
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "tester\n");
@@ -903,6 +914,102 @@ async function suiteHooks() {
   assert("hooks install: idempotent (scope-check not duplicated)", scopeHookCount === 1, scopeHookCount);
 }
 
+async function suiteScopeHardening() {
+  process.stdout.write("\n[scope-hardening]\n");
+
+  const target = fixture("hardening-target", {
+    "package.json": JSON.stringify({ name: "t" }),
+  });
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+
+  const scopeCheck = path.join(target, ".agent/checks/scope-check.sh");
+  const bashGuard = path.join(target, ".agent/checks/bash-write-guard.sh");
+  const sessionDir = path.join(target, ".agent/session");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "generator\n");
+
+  const writeInput = (rel) =>
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, rel), content: "x" } });
+  const bashInput = (command) =>
+    JSON.stringify({ tool_name: "Bash", tool_input: { command } });
+
+  // --- Gap 0: contract-controlled files are never agent-writable via file tools ---
+  const protectedPaths = [
+    ".agent/session/active-role.txt",
+    ".agent/roles/generator.yaml",
+    ".agent/checks/scope-check.sh",
+    ".agent/checks/scope-lib.sh",
+    ".claude/settings.json",
+  ];
+  for (const rel of protectedPaths) {
+    const code = runScriptWithInput(scopeCheck, [], writeInput(rel));
+    assert(`scope-check: BLOCKS write to contract-controlled ${rel}`, code === 1, code);
+  }
+
+  // Gap 0 regression: writable .agent infra (memory/decisions) still passes
+  const infraCode = runScriptWithInput(scopeCheck, [], writeInput(".agent/memory/decisions.jsonl"));
+  assert("scope-check: still ALLOWS writable .agent/ infra (.agent/memory)", infraCode === 0, infraCode);
+
+  // --- Gap 3: empty-scope role is fail-closed (read-only) ---
+  // reviewer declares may_create: [] / may_modify: [] → must not write source
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "reviewer\n");
+  const reviewerCode = runScriptWithInput(scopeCheck, [], writeInput("src/whatever.ts"));
+  assert("scope-check: empty-scope role (reviewer) is fail-closed on source write", reviewerCode === 1, reviewerCode);
+  // restore a writing role for later
+  fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "generator\n");
+
+  // --- Gap 1: bash-write-guard blocks Bash tampering with contract-controlled files ---
+  const blockedCommands = [
+    'echo generator > .agent/session/active-role.txt',
+    'echo "x" >> .agent/roles/generator.yaml',
+    "sed -i 's/a/b/' .agent/checks/scope-check.sh",
+    "rm .agent/checks/scope-check.sh",
+    "cp /tmp/evil.yaml .agent/roles/generator.yaml",
+    'printf "{}" > .claude/settings.json',
+  ];
+  for (const cmd of blockedCommands) {
+    const code = runScriptWithInput(bashGuard, [], bashInput(cmd));
+    assert(`bash-write-guard: BLOCKS \`${cmd.slice(0, 42)}…\``, code === 1, code);
+  }
+
+  // bash-write-guard must NOT block legitimate commands (low false-positive)
+  const allowedCommands = [
+    "cat .agent/roles/generator.yaml",            // read of a protected path, no write op
+    "grep -r foo .agent/checks 2>/dev/null",      // read + unrelated stderr redirect
+    "echo hello > src/foo.ts",                    // write, but not a protected path → outcome layer's job
+    "npm test",                                   // no protected path at all
+    "git add .agent/roles/generator.yaml",        // staging is not a file write ('add' must not match 'dd')
+    "git diff .agent/checks/scope-check.sh",      // read-only diff
+    "bash .agent/checks/pre-generate.sh spec.json generator", // sanctioned: runs a protected script, doesn't write it
+  ];
+  for (const cmd of allowedCommands) {
+    const code = runScriptWithInput(bashGuard, [], bashInput(cmd));
+    assert(`bash-write-guard: ALLOWS \`${cmd.slice(0, 42)}…\``, code === 0, code);
+  }
+
+  // --- Gap 3 at the outcome layer: post-generate fail-closed for read-only role ---
+  // Needs a git repo so post-generate sees a diff.
+  const gitTarget = fixture("hardening-postgen", { "package.json": JSON.stringify({ name: "t" }) });
+  execSync("git init && git add . && git commit -m init --allow-empty-message", { cwd: gitTarget, stdio: "pipe" });
+  await captureStdout(async () => init({ cwd: gitTarget, flags: {} }));
+  const gitSession = path.join(gitTarget, ".agent/session");
+  fs.mkdirSync(gitSession, { recursive: true });
+  const postGen = path.join(gitTarget, ".agent/checks/post-generate.sh");
+
+  // reviewer (read-only) changes a source file → HARD FAIL
+  fs.mkdirSync(path.join(gitTarget, "src"), { recursive: true });
+  fs.writeFileSync(path.join(gitTarget, "src/leak.ts"), "export const x = 1;\n");
+  execSync("git add src/leak.ts", { cwd: gitTarget, stdio: "pipe" });
+  fs.writeFileSync(path.join(gitSession, "active-role.txt"), "reviewer\n");
+  const reviewerOutcome = runScript(postGen, []);
+  assert("post-generate: read-only role (reviewer) source change is HARD FAIL", reviewerOutcome === 1, reviewerOutcome);
+
+  // generator changing the same source file is in scope → passes scope (and the lean stack has no other gates)
+  fs.writeFileSync(path.join(gitSession, "active-role.txt"), "generator\n");
+  const generatorOutcome = runScript(postGen, []);
+  assert("post-generate: generator source change passes scope check", generatorOutcome === 0, generatorOutcome);
+}
+
 async function suiteVersion() {
   process.stdout.write("\n[version]\n");
 
@@ -962,6 +1069,7 @@ async function suiteVersion() {
     await suiteTokens();
     await suiteMap();
     await suiteHooks();
+    await suiteScopeHardening();
     await suiteVersion();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
