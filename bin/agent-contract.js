@@ -58,12 +58,17 @@ function printHelp() {
       "  --persona <name>       Re-apply a persona to role YAMLs (default: reads from manifest.yaml)",
       "                           pragmatist | architect | vibecoder | lead",
       "  --skip-self-update     Skip the automatic npm version check (useful in CI or offline environments)",
+      "  --allow-scope-change   Consent to roles gaining writable paths. Without it, update prints",
+      "                         the widened globs and refuses. Blocked inside an agent session —",
+      "                         run it from your own terminal.",
       "",
       "Flags (run):",
       "  --role <name>    Role to activate: generator | integrator | tester | debugger | documenter",
       "  --task <text>    Task description (used when --spec is not provided)",
       "  --spec <file>    Path to a JSON task spec (required fields per role)",
       "  --provider <p>   Override provider (see below)",
+      "  --effort <level> Reasoning depth: low | medium | high | xhigh | max",
+      "                   Overrides the role's own effort and .agent/config.yaml",
       "",
       "Providers (auto-detected in order if --provider is not set):",
       "  claude-code  Uses your Claude Pro/Max subscription via the installed `claude` CLI. (default)",
@@ -77,6 +82,8 @@ function printHelp() {
       "  OPENAI_API_KEY      Required for the openai provider",
       "  AGENT_PROVIDER      Override provider (same as --provider)",
       "  AGENT_MODEL         Override model ID (anthropic/openai only)",
+      "  AGENT_EFFORT        Override reasoning effort (anthropic only)",
+      "  OPENAI_MODEL        Override the openai provider's model ID",
       "",
     ].join("\n")
   );
@@ -228,6 +235,8 @@ function parseFlags(args) {
     else if (a === "--task") flags.task = args[++i];
     else if (a === "--spec") flags.spec = args[++i];
     else if (a === "--provider") flags.provider = args[++i];
+    else if (a === "--effort") flags.effort = args[++i];
+    else if (a === "--allow-scope-change") flags.allowScopeChange = true;
     else if (a === "--preset") flags.preset = args[++i];
     else if (a === "--persona") flags.persona = args[++i];
     else if (a.startsWith("--")) flags[a.slice(2)] = true;

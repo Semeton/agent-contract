@@ -576,7 +576,7 @@
       <div class="card enforce-card reveal">
         <span class="chip enf">enforces</span>
         <h3>The <code>.agent/</code> contract</h3>
-        <p>A <code>PreToolUse</code> hook reads the active role and blocks any write outside its declared scope. <b style="color:#C4CAD8">Fail-closed</b> — no role declared, no source writes. The agent can't even widen its own scope: the role files are off-limits in-session.</p>
+        <p>A <code>PreToolUse</code> hook reads the active role and blocks any write outside its declared scope. <b style="color:#C4CAD8">Fail-closed</b> — a write it can't attribute to exactly one role is refused. The agent can't widen its own scope either: role files are off-limits in-session, and granting reach needs consent from a human terminal.</p>
       </div>
     </div>
   </section>
@@ -586,17 +586,17 @@
     <div class="section-head reveal">
       <span class="eyebrow">the loop · any agent, any model</span>
       <h2>Five gates between a prompt and your codebase.</h2>
-      <p>Each is a shell script that exits non-zero on a violation. The orchestrator reads exit codes, not promises.</p>
+      <p>Four of them are shell scripts that exit non-zero on a violation. The orchestrator reads exit codes, not promises.</p>
     </div>
     <div class="seq">
       <div class="step reveal">
         <div class="num">01</div>
-        <div class="body"><h3>Boot</h3><p>The agent reads the contract before it reads your source: latest handoff → <code>manifest.yaml</code> → codebase map → its role.</p></div>
+        <div class="body"><h3>Orient</h3><p>An always-on shim states the rules the hooks enforce and points at the contract — <code>manifest.yaml</code>, codebase map, conventions, prior handoffs. No mandated reading order; the agent reads what the task needs.</p></div>
         <div class="tag">read-only</div>
       </div>
       <div class="step reveal">
         <div class="num">02</div>
-        <div class="body"><h3>Declare scope</h3><p><code>pre-generate.sh</code> validates the task spec has what it needs, then writes the active role — which arms the enforcement hook.</p></div>
+        <div class="body"><h3>Declare scope</h3><p><code>pre-generate.sh</code> validates the task spec has what it needs, then writes the active role — which arms the enforcement hook. Editing existing code infers the role from the target; creating new source still requires the spec.</p></div>
         <div class="tag">gate</div>
       </div>
       <div class="step reveal">
@@ -611,7 +611,7 @@
       </div>
       <div class="step reveal">
         <div class="num">05</div>
-        <div class="body"><h3>Hand off</h3><p>A <code>Stop</code> hook writes a handoff note on any turn with changes, so the next session boots with the decisions instead of starting over.</p></div>
+        <div class="body"><h3>Hand off</h3><p>A <code>Stop</code> hook writes a handoff note on any turn with changes, so the next session picks up the decisions instead of starting over.</p></div>
         <div class="tag">memory</div>
       </div>
     </div>
@@ -756,12 +756,12 @@
   var script = [
     { t: "# after init, you just write the prompt — the contract does the rest", c: "muted", pause: 450 },
     { t: "fix the null check in payroll invoicing", c: "cmd", type: true, pause: 560 },
-    { t: "contract ▸ booted · role: generator · scope: src/payroll/**", c: "pass", pause: 540 },
+    { t: "contract ▸ active · role: integrator (inferred) · scope: src/payroll/**", c: "pass", pause: 540 },
     { t: "", c: "muted", pause: 120 },
     { t: "agent ▸ Edit  src/payroll/invoice.ts          ✓ allowed", c: "label", pass: true, pause: 360 },
     { t: "agent ▸ Edit  src/payroll/invoice.test.ts     ✓ allowed", c: "label", pass: true, pause: 420 },
     { t: "agent ▸ Edit  src/auth/session.ts             ✗ BLOCKED", c: "block", shake: true, pause: 280 },
-    { t: "scope-check: BLOCKED — src/auth/session.ts is outside\nrole 'generator' scope (src/payroll/**).  exit 2", c: "blockbox", pause: 560 },
+    { t: "scope-check: BLOCKED — src/auth/session.ts is outside\nrole 'integrator' scope (src/payroll/**).  exit 2", c: "blockbox", pause: 560 },
     { t: "", c: "muted", pause: 100 },
     { t: "✓ 1 fix shipped. 0 files touched outside scope.", c: "win", pause: 0 }
   ];

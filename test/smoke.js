@@ -17,10 +17,16 @@ const { detectStack } = require("../lib/detect");
 const { init } = require("../lib/commands/init");
 const { run } = require("../lib/commands/run");
 const { update } = require("../lib/commands/update");
+const { status } = require("../lib/commands/status");
 const { learnConventions } = require("../lib/learn");
 const { buildCodebaseMap, isGreenfield } = require("../lib/util/map");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "agent-contract-test-"));
+
+// update() gates --force / --allow-scope-change on a controlling terminal. The suite has
+// none, so it takes the documented CI escape hatch. Individual tests unset this to prove
+// the gate still bites.
+process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = "1";
 let failures = 0;
 let passes = 0;
 
@@ -244,10 +250,18 @@ async function suiteInit() {
   assert("init: codebase-map.md has opening marker", codemapContent.includes("<!-- agent-contract:codebase-map -->"));
   assert("init: codebase-map.md has closing marker", codemapContent.includes("<!-- /agent-contract:codebase-map -->"));
 
-  // shim contains the new boot sequence
+  // The shim states the mechanically-enforced rules and nothing else. It is always-on
+  // context in every session of every target repo, so regrowth is a cost regression —
+  // the budget assertion below is the guard against that.
   const claudeMd = fs.readFileSync(path.join(target, "CLAUDE.md"), "utf8");
-  assert("init: CLAUDE.md shim references boot sequence", claudeMd.includes("Boot Sequence"));
-  assert("init: CLAUDE.md shim references handoff protocol", claudeMd.includes("Session Handoff Protocol"));
+  assert("init: CLAUDE.md shim states the role gate", claudeMd.includes("Declare a role before writing source"));
+  assert("init: CLAUDE.md shim states contract files are off-limits", claudeMd.includes("off-limits in-session"));
+  assert("init: CLAUDE.md shim states scope enforcement", claudeMd.includes("Stay in your role's scope"));
+  assert("init: CLAUDE.md shim does NOT mandate a boot sequence", !claudeMd.includes("Boot Sequence"));
+  assert("init: CLAUDE.md shim does NOT mandate a reading order", !claudeMd.includes("Do NOT read raw source files"));
+  const shimBody = require("../lib/util/templates").shimContent();
+  const shimTokens = Math.ceil(shimBody.length / 4);
+  assert("init: shim stays within its 450-token budget", shimTokens <= 450, shimTokens);
 
   // new hook scripts
   for (const rel of [
@@ -313,6 +327,48 @@ async function suiteInit() {
   const merged2 = fs.readFileSync(path.join(target2, "CLAUDE.md"), "utf8");
   const shimCount = (merged2.match(/<!-- agent-contract:shim -->/g) || []).length;
   assert("shim merge: idempotent (one shim block)", shimCount === 1, shimCount);
+
+  // An existing shim block must be REFRESHED in place, not skipped. Skipping would
+  // freeze every already-initialized repo at whatever shim version first wrote it,
+  // making `agent-contract update` unable to ship a shim change.
+  const target3 = fixture("init-target-refresh", {
+    "package.json": JSON.stringify({ name: "t" }),
+    "CLAUDE.md":
+      "# my notes\nkeep this head\n\n<!-- agent-contract:shim -->\n# Agent Contract\n\n" +
+      "## Boot Sequence\n1. stale instruction from an older version\n" +
+      "<!-- /agent-contract:shim -->\n\n## my tail section\nkeep this tail\n",
+  });
+  await captureStdout(async () => init({ cwd: target3, flags: {} }));
+  const refreshed = fs.readFileSync(path.join(target3, "CLAUDE.md"), "utf8");
+  assert("shim refresh: stale shim body is replaced", !refreshed.includes("stale instruction from an older version"));
+  assert("shim refresh: stale boot sequence is gone", !refreshed.includes("Boot Sequence"));
+  assert("shim refresh: current shim body is present", refreshed.includes("Declare a role before writing source"));
+  assert("shim refresh: user content above the shim survives", refreshed.startsWith("# my notes\nkeep this head\n\n"));
+  assert("shim refresh: user content below the shim survives", refreshed.includes("## my tail section\nkeep this tail\n"));
+  assert(
+    "shim refresh: still exactly one shim block",
+    (refreshed.match(/<!-- agent-contract:shim -->/g) || []).length === 1,
+    (refreshed.match(/<!-- agent-contract:shim -->/g) || []).length
+  );
+
+  // A second refresh must be a true no-op, byte for byte.
+  await captureStdout(async () => init({ cwd: target3, flags: {} }));
+  assert(
+    "shim refresh: second run is byte-identical",
+    fs.readFileSync(path.join(target3, "CLAUDE.md"), "utf8") === refreshed
+  );
+
+  // Half a marker pair means the block's boundaries are unknowable — leave it alone.
+  const target4 = fixture("init-target-halfmarker", {
+    "package.json": JSON.stringify({ name: "t" }),
+    "CLAUDE.md": "# notes\n<!-- agent-contract:shim -->\nno closing marker here\n",
+  });
+  const halfBefore = fs.readFileSync(path.join(target4, "CLAUDE.md"), "utf8");
+  await captureStdout(async () => init({ cwd: target4, flags: {} }));
+  assert(
+    "shim refresh: half-marker file is left untouched",
+    fs.readFileSync(path.join(target4, "CLAUDE.md"), "utf8") === halfBefore
+  );
 }
 
 async function suiteChecks() {
@@ -505,14 +561,26 @@ async function suiteTokens() {
   assert("tokens: estimateTokens empty string → 0", estimateTokens("") === 0, null);
 
   // limitForModel: known model returns expected limit
-  assert("tokens: limitForModel claude-opus-4-7 → 200000", limitForModel("claude-opus-4-7") === 200000, null);
+  assert("tokens: limitForModel claude-opus-5 → 1M", limitForModel("claude-opus-5") === 1000000, null);
+  assert("tokens: limitForModel claude-opus-4-7 → 1M", limitForModel("claude-opus-4-7") === 1000000, null);
+  assert("tokens: limitForModel claude-sonnet-5 → 1M", limitForModel("claude-sonnet-5") === 1000000, null);
+  assert("tokens: limitForModel claude-fable-5 → 1M", limitForModel("claude-fable-5") === 1000000, null);
+  // Prefix matching must not let a 1M key swallow a 200K model listed after it.
+  assert("tokens: limitForModel claude-opus-4-5 → 200K (not shadowed by opus-5)", limitForModel("claude-opus-4-5") === 200000, limitForModel("claude-opus-4-5"));
+  assert("tokens: limitForModel claude-haiku-4-5 → 200K", limitForModel("claude-haiku-4-5") === 200000, null);
+  assert("tokens: limitForModel dated suffix resolves by prefix", limitForModel("claude-opus-4-6-20260101") === 1000000, null);
   assert("tokens: limitForModel gpt-4o → 128000", limitForModel("gpt-4o") === 128000, null);
   assert("tokens: limitForModel unknown falls back to default", limitForModel("unknown-model-xyz") === 100000, null);
 
   // checkUsage: calculates pct correctly
   const info = checkUsage({ input_tokens: 140000, output_tokens: 30000 }, "claude-opus-4-7");
   assert("tokens: checkUsage total = input + output", info.total === 170000, info.total);
-  assert("tokens: checkUsage pct = 85% for 170k/200k", info.pct === 85, info.pct);
+  assert("tokens: checkUsage pct = 17% for 170k/1M", info.pct === 17, info.pct);
+  // 170k used to read as 85% of a 200K window and tripped the handoff threshold.
+  // Against the real 1M window it must not.
+  assert("tokens: 170k does NOT trip handoff on a 1M model", info.ratio < HANDOFF_THRESHOLD, info.ratio);
+  const small = checkUsage({ input_tokens: 140000, output_tokens: 30000 }, "claude-haiku-4-5");
+  assert("tokens: 170k DOES trip handoff on a 200K model", small.ratio >= HANDOFF_THRESHOLD, small.ratio);
 
   // WARN and HANDOFF thresholds are defined
   assert("tokens: WARN_THRESHOLD is 0.70", WARN_THRESHOLD === 0.70, WARN_THRESHOLD);
@@ -914,6 +982,510 @@ async function suiteHooks() {
   assert("hooks install: idempotent (scope-check not duplicated)", scopeHookCount === 1, scopeHookCount);
 }
 
+async function suiteRoleInference() {
+  process.stdout.write("\n[role inference]\n");
+
+  const { parseRoleScope, writableGlobs } = require("../lib/util/scope");
+
+  const target = fixture("infer", {
+    "package.json": JSON.stringify({ name: "ir", version: "1.0.0" }),
+    "lib/a.js": "module.exports = 1;",
+    "test/a.test.js": "// t",
+    "README.md": "# r",
+    "docs/guide.md": "# g",
+  });
+  await captureStdout(async () => init({ cwd: target, flags: { yes: true } }));
+
+  const sc = path.join(target, ".agent/checks/scope-check.sh");
+  const session = path.join(target, ".agent/session/active-role.txt");
+
+  // Each probe starts from a fresh session so inference is what is being measured.
+  const probe = (rel) => {
+    try { fs.rmSync(session); } catch {}
+    const code = runScriptWithInput(sc, [], JSON.stringify({
+      tool_name: "Write", tool_input: { file_path: path.join(target, rel) },
+    }));
+    let role = null;
+    try { role = fs.readFileSync(session, "utf8").trim(); } catch {}
+    return { code, role };
+  };
+
+  // Editing an existing file resolves through may_modify, which is unique per area.
+  let r = probe("lib/a.js");
+  assert("infer: existing source -> integrator", r.code === 0 && r.role === "integrator", r);
+  r = probe("test/a.test.js");
+  assert("infer: existing test -> tester", r.code === 0 && r.role === "tester", r);
+  r = probe("README.md");
+  assert("infer: README -> documenter", r.code === 0 && r.role === "documenter", r);
+  r = probe("docs/guide.md");
+  assert("infer: existing doc -> documenter", r.code === 0 && r.role === "documenter", r);
+
+  // Creating resolves through may_create. New source belongs to generator, which
+  // declares inputs_required — so the spec gate must still bite rather than infer.
+  r = probe("lib/brand-new.js");
+  assert("infer: new source still requires a spec", r.code === 1 && r.role === null, r);
+  r = probe("src/brand-new.ts");
+  assert("infer: new src/ also requires a spec", r.code === 1 && r.role === null, r);
+
+  // New tests and docs are unambiguous among roles that need no spec.
+  r = probe("test/new.test.js");
+  assert("infer: new test -> tester", r.code === 0 && r.role === "tester", r);
+  r = probe("docs/new.md");
+  assert("infer: new doc -> documenter", r.code === 0 && r.role === "documenter", r);
+
+  // Paths no role covers stay blocked, and nothing is persisted.
+  r = probe("package.json");
+  assert("infer: uncovered existing path blocked", r.code === 1 && r.role === null, r);
+  r = probe("Makefile");
+  assert("infer: uncovered new path blocked", r.code === 1 && r.role === null, r);
+
+  // Inference grants nothing beyond the role it picks.
+  try { fs.rmSync(session); } catch {}
+  runScriptWithInput(sc, [], JSON.stringify({
+    tool_name: "Write", tool_input: { file_path: path.join(target, "test/a.test.js") },
+  }));
+  assert("infer: persisted role is tester", fs.readFileSync(session, "utf8").trim() === "tester", null);
+  const afterInfer = runScriptWithInput(sc, [], JSON.stringify({
+    tool_name: "Write", tool_input: { file_path: path.join(target, "lib/a.js") },
+  }));
+  assert("infer: inferred tester still cannot write lib/", afterInfer === 1, afterInfer);
+
+  // An explicitly declared role is never overridden by inference.
+  fs.writeFileSync(session, "documenter\n");
+  assert("infer: explicit role still enforced",
+    runScriptWithInput(sc, [], JSON.stringify({
+      tool_name: "Write", tool_input: { file_path: path.join(target, "lib/a.js") },
+    })) === 1, null);
+  assert("infer: explicit role still permitted in its own scope",
+    runScriptWithInput(sc, [], JSON.stringify({
+      tool_name: "Write", tool_input: { file_path: path.join(target, "docs/guide.md") },
+    })) === 0, null);
+
+  // Contract-controlled paths are unaffected by inference.
+  try { fs.rmSync(session); } catch {}
+  assert("infer: never infers a role for a contract-controlled path",
+    runScriptWithInput(sc, [], JSON.stringify({
+      tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/roles/generator.yaml") },
+    })) === 1, null);
+  assert("infer: no role persisted after a protected-path block",
+    !fs.existsSync(session), null);
+
+  // Read-only roles declare no writable globs, so they can never be inferred.
+  const roleOf = (name) => fs.readFileSync(path.join(target, ".agent/roles", name + ".yaml"), "utf8");
+  for (const ro of ["reviewer", "security"]) {
+    assert("infer: " + ro + " declares no writable globs",
+      writableGlobs(parseRoleScope(roleOf(ro))).length === 0, ro);
+  }
+
+  // -- status reports role drift in BOTH directions --------------------------
+  // An earlier version only flagged scopes wider than the template, so a contract
+  // that was simply never updated read as clean.
+  const genPath = path.join(target, ".agent/roles/generator.yaml");
+  const genOrig = fs.readFileSync(genPath, "utf8");
+  fs.writeFileSync(genPath, genOrig.replace("  - bin/**\n", ""));
+  let out = "";
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { out += chunk; return true; };
+  try {
+    await status({ cwd: target });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  assert("drift: narrower-than-template role is reported",
+    out.includes("NARROWER than template"), out.split("\n").filter((l) => l.includes("roles:")));
+  assert("drift: names the missing glob", out.includes("bin/**"), null);
+  fs.writeFileSync(genPath, genOrig);
+
+  out = "";
+  process.stdout.write = (chunk) => { out += chunk; return true; };
+  try {
+    await status({ cwd: target });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  assert("drift: clean contract reports roles matching templates",
+    out.includes("roles:      match the installed templates"), out.split("\n").filter((l) => l.includes("roles:")));
+}
+
+async function suiteScopeGuard() {
+  process.stdout.write("\n[scope guard]\n");
+
+  const { parseRoleScope, writableGlobs, diffRoleScope } = require("../lib/util/scope");
+
+  // ── parser: must read exactly what the shell guard reads ──────────────────
+  const blockList = [
+    "role: generator",
+    "scope:",
+    "  may_create:",
+    "  - src/**",
+    "  - lib/**",
+    "  may_modify: []",
+    "  may_delete: []",
+    "handoff_to: integrator",
+  ].join("\n");
+  const parsed = parseRoleScope(blockList);
+  assert("scope: parses block list", JSON.stringify(parsed.may_create) === '["src/**","lib/**"]', parsed.may_create);
+  assert("scope: parses inline [] as empty", parsed.may_modify.length === 0, parsed.may_modify);
+  assert("scope: stops at next top-level key", !JSON.stringify(parsed).includes("integrator"), parsed);
+  assert("scope: writableGlobs unions create+modify, sorted",
+    JSON.stringify(writableGlobs(parsed)) === '["lib/**","src/**"]', writableGlobs(parsed));
+
+  const noScope = parseRoleScope("role: reviewer\nresponsibility: none\n");
+  assert("scope: missing scope block yields empty (read-only)",
+    writableGlobs(noScope).length === 0, noScope);
+
+  // ── diff direction ────────────────────────────────────────────────────────
+  const narrow = "scope:\n  may_create:\n  - docs/**\n  may_modify: []\n  may_delete: []\n";
+  const wide = "scope:\n  may_create:\n  - docs/**\n  - bin/**\n  may_modify: []\n  may_delete: []\n";
+  const widened = diffRoleScope(narrow, wide);
+  assert("scope: gaining a glob is a widening", widened.widens === true && widened.added[0] === "bin/**", widened);
+  const narrowed = diffRoleScope(wide, narrow);
+  assert("scope: losing a glob is not a widening", narrowed.widens === false, narrowed);
+  assert("scope: narrowing is reported as removed", narrowed.removed[0] === "bin/**", narrowed);
+  const delWide = diffRoleScope(narrow, "scope:\n  may_create:\n  - docs/**\n  may_modify: []\n  may_delete:\n  - docs/**\n");
+  assert("scope: gaining delete reach is a widening", delWide.widens === true && delWide.addedDelete[0] === "docs/**", delWide);
+  assert("scope: identical roles do not widen", diffRoleScope(wide, wide).widens === false, null);
+
+  // ── the guard, end to end ─────────────────────────────────────────────────
+  const target = fixture("scope-guard", {
+    "package.json": JSON.stringify({ name: "sg", version: "1.0.0" }),
+    "lib/x.js": "module.exports = 1;\n",
+  });
+  await captureStdout(async () => init({ cwd: target, flags: { yes: true } }));
+
+  const genPath = path.join(target, ".agent/roles/generator.yaml");
+  const full = fs.readFileSync(genPath, "utf8");
+  assert("scope: js fixture grants generator bin/**", full.includes("- bin/**"), full);
+
+  // Hand-narrow the role, then let update try to regenerate it wider.
+  fs.writeFileSync(genPath, full.replace("  - bin/**\n", ""));
+  let code = await captureAll(async () => update({ cwd: target, flags: { skipSelfUpdate: true } }));
+  assert("scope: update refuses to widen without consent", code === 1, code);
+  assert("scope: refused run wrote nothing",
+    !fs.readFileSync(genPath, "utf8").includes("- bin/**"), null);
+
+  code = await captureAll(async () => update({ cwd: target, flags: { skipSelfUpdate: true, allowScopeChange: true } }));
+  assert("scope: --allow-scope-change applies the widening", code === 0, code);
+  assert("scope: role regained the glob",
+    fs.readFileSync(genPath, "utf8").includes("- bin/**"), null);
+
+  // A corrupted role parses as empty scope, so restoring it looks like a widening.
+  // --force has to carry consent or the repair path is unreachable.
+  fs.writeFileSync(genPath, "CORRUPTED\n");
+  code = await captureAll(async () => update({ cwd: target, flags: { skipSelfUpdate: true, force: true } }));
+  assert("scope: --force implies consent", code === 0, code);
+  assert("scope: --force restored the role",
+    fs.readFileSync(genPath, "utf8").includes("- bin/**"), null);
+
+  // Steady state: nothing to widen, so the guard must not fire.
+  code = await captureAll(async () => update({ cwd: target, flags: { skipSelfUpdate: true } }));
+  assert("scope: guard silent when nothing widens", code === 0, code);
+
+  // ── documenter owns the agent-facing shims ────────────────────────────────
+  const T = require("../lib/util/templates");
+  const docScope = parseRoleScope(T.roleYaml("documenter", "pragmatist", { language: "javascript" }));
+  for (const f of T.SHIM_FILES) {
+    assert(`scope: documenter may write ${f}`, docScope.may_modify.includes(f), docScope.may_modify);
+  }
+  const intScope = parseRoleScope(T.roleYaml("integrator", "pragmatist", { language: "javascript" }));
+  assert("scope: integrator may modify bin/**", intScope.may_modify.includes("bin/**"), intScope.may_modify);
+  const reviewerScope = parseRoleScope(T.roleYaml("reviewer", "pragmatist", { language: "javascript" }));
+  assert("scope: reviewer stays read-only", writableGlobs(reviewerScope).length === 0, reviewerScope);
+
+  // ── bash guard blocks the consent flags in-session ────────────────────────
+  const guard = path.join(target, ".agent/checks/bash-write-guard.sh");
+  const bash = (cmd) => runScriptWithInput(guard, [], JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }));
+  assert("scope: bash guard blocks --allow-scope-change",
+    bash("agent-contract update --allow-scope-change") === 1, null);
+  assert("scope: bash guard blocks node-invoked --allow-scope-change",
+    bash("node bin/agent-contract.js update --cwd . --allow-scope-change") === 1, null);
+  assert("scope: bash guard blocks update --force", bash("agent-contract update --force") === 1, null);
+  assert("scope: bash guard blocks init --force", bash("agent-contract init --force") === 1, null);
+  assert("scope: bash guard blocks npx form", bash("npx agent-contract update --force") === 1, null);
+  assert("scope: bash guard allows plain update", bash("agent-contract update") === 0, null);
+  assert("scope: bash guard allows dry-run", bash("agent-contract update --dry-run") === 0, null);
+  assert("scope: bash guard allows npm test", bash("npm test") === 0, null);
+  assert("scope: bash guard allows a commit mentioning the flag",
+    bash("git commit -m 'document --allow-scope-change'") === 0, null);
+
+  // ── toolchain integrity ───────────────────────────────────────────────────
+  // The installed package sits outside the repo, and every check is regenerated from
+  // its templates — so an unguarded out-of-repo write is a route to neutering the
+  // guards from any target repo, not just a self-hosted one.
+  const sc = path.join(target, ".agent/checks/scope-check.sh");
+  const writeTo = (p) => runScriptWithInput(sc, [], JSON.stringify({ tool_name: "Write", tool_input: { file_path: p } }));
+
+  assert("toolchain: blocks writes to an installed agent-contract lib",
+    writeTo("/usr/local/lib/node_modules/@semeton/agent-contract/lib/util/templates.js") === 1, null);
+  assert("toolchain: blocks writes to an installed agent-contract bin",
+    writeTo("/opt/homebrew/lib/node_modules/agent-contract/bin/agent-contract.js") === 1, null);
+  assert("toolchain: blocks writes to its package.json",
+    writeTo("/usr/local/lib/node_modules/agent-contract/package.json") === 1, null);
+  assert("toolchain: blocks hook settings anywhere",
+    writeTo(path.join(os.homedir(), ".claude/settings.json")) === 1, null);
+  assert("toolchain: still allows unrelated out-of-repo writes",
+    writeTo("/tmp/scratch-file.js") === 0, null);
+  assert("toolchain: still allows a sibling project",
+    writeTo(path.join(os.tmpdir(), "some-other-project/src/x.js")) === 0, null);
+
+  // A stale scope-lib.sh (one predating the helper) must not fall open: an undefined
+  // function returns 127, which an `if` reads as "not protected".
+  const slPath = path.join(target, ".agent/checks/scope-lib.sh");
+  const slOrig = fs.readFileSync(slPath, "utf8");
+  assert("toolchain: scope-lib defines the abs helper",
+    slOrig.includes("scope_is_protected_abs"), null);
+  fs.writeFileSync(slPath, slOrig.replace(/scope_is_protected_abs\(\)[\s\S]*?\n}\n/, ""));
+  assert("toolchain: fails closed when scope-lib is stale",
+    writeTo("/usr/local/lib/node_modules/agent-contract/lib/util/templates.js") === 1, null);
+  assert("toolchain: stale scope-lib still allows unrelated paths",
+    writeTo("/tmp/scratch-file.js") === 0, null);
+  fs.writeFileSync(slPath, slOrig);
+
+  // ── enforcement-surface consent when self-hosted ──────────────────────────
+  // Vendor bin+lib into the fixture so the running CLI's templates live inside the
+  // repo it is updating — the case where an agent with lib/ scope owns the guards.
+  const vend = fixture("vendored", {
+    "package.json": JSON.stringify({ name: "vendored", version: "1.0.0" }),
+  });
+  for (const d of ["bin", "lib"]) {
+    fs.cpSync(path.join(__dirname, "..", d), path.join(vend, d), { recursive: true });
+  }
+  const cli = path.join(vend, "bin/agent-contract.js");
+  const sh = (args) => {
+    try {
+      execSync(`node '${cli}' ${args}`, { cwd: vend, stdio: "pipe" });
+      return 0;
+    } catch (e) { return e.status || 1; }
+  };
+  assert("self-hosted: init succeeds", sh("init --cwd . --yes") === 0, null);
+  assert("self-hosted: steady-state update is silent", sh("update --cwd . --skip-self-update") === 0, null);
+
+  // Now tamper with the guard's own generator, exactly as an lib/-scoped agent could.
+  const tmplPath = path.join(vend, "lib/util/templates.js");
+  const tmpl = fs.readFileSync(tmplPath, "utf8");
+  fs.writeFileSync(tmplPath, tmpl.replace('RE3="agent-contract', 'RE3="NEVERMATCHagent-contract'));
+  assert("self-hosted: plain update refuses to deploy edited guards",
+    sh("update --cwd . --skip-self-update") === 1, null);
+  assert("self-hosted: the guard on disk is untouched",
+    fs.readFileSync(path.join(vend, ".agent/checks/bash-write-guard.sh"), "utf8").includes('RE3="agent-contract'), null);
+  assert("self-hosted: consent deploys it",
+    sh("update --cwd . --skip-self-update --allow-scope-change") === 0, null);
+  assert("self-hosted: consented change landed",
+    fs.readFileSync(path.join(vend, ".agent/checks/bash-write-guard.sh"), "utf8").includes("NEVERMATCH"), null);
+
+  // The normal case must be unaffected: templates outside the repo are upstream, so a
+  // plain update still ships improved checks. Breaking this breaks self-update.
+  const plain = fixture("not-self-hosted", {
+    "package.json": JSON.stringify({ name: "nsh", version: "1.0.0" }),
+    "lib/a.js": "module.exports = 1;\n",
+  });
+  await captureStdout(async () => init({ cwd: plain, flags: { yes: true } }));
+  const psc = path.join(plain, ".agent/checks/scope-check.sh");
+  fs.writeFileSync(psc, fs.readFileSync(psc, "utf8").replace("#!/usr/bin/env bash", "#!/usr/bin/env bash\n# STALE"));
+  const code2 = await captureAll(async () => update({ cwd: plain, flags: { skipSelfUpdate: true } }));
+  assert("not-self-hosted: plain update needs no consent", code2 === 0, code2);
+  assert("not-self-hosted: upstream check applied",
+    !fs.readFileSync(psc, "utf8").includes("# STALE"), null);
+
+  // -- consent requires a human, not a matchable command string --------------
+  // The Bash guard can only pattern-match how a command was typed, and shell
+  // indirection defeats that. The gate that actually holds lives in update() itself.
+  const gateTarget = fixture("consent-gate", {
+    "package.json": JSON.stringify({ name: "cg", version: "1.0.0" }),
+    "lib/a.js": "module.exports = 1;",
+  });
+  await captureStdout(async () => init({ cwd: gateTarget, flags: { yes: true } }));
+
+  delete process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT;
+  try {
+    let c = await captureAll(async () => update({ cwd: gateTarget, flags: { skipSelfUpdate: true, force: true } }));
+    assert("consent: --force refused with no TTY and no hatch", c === 1, c);
+    c = await captureAll(async () => update({ cwd: gateTarget, flags: { skipSelfUpdate: true, allowScopeChange: true } }));
+    assert("consent: --allow-scope-change refused with no TTY and no hatch", c === 1, c);
+    c = await captureAll(async () => update({ cwd: gateTarget, flags: { skipSelfUpdate: true } }));
+    assert("consent: plain update unaffected by the gate", c === 0, c);
+  } finally {
+    process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = "1";
+  }
+  const c2 = await captureAll(async () => update({ cwd: gateTarget, flags: { skipSelfUpdate: true, force: true } }));
+  assert("consent: hatch re-enables --force", c2 === 0, c2);
+
+  const bwg = path.join(gateTarget, ".agent/checks/bash-write-guard.sh");
+  const bash2 = (cmd) => runScriptWithInput(bwg, [], JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }));
+  assert("consent: bash guard blocks setting the hatch",
+    bash2("AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1 agent-contract update") === 1, null);
+  assert("consent: bash guard blocks the hatch even without a subcommand",
+    bash2("export AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1") === 1, null);
+
+  // -- enforcement wiring drift ---------------------------------------------
+  const pgCheck = path.join(gateTarget, ".agent/checks/pre-generate.sh");
+  const specPath = path.join(gateTarget, "spec.json");
+  fs.writeFileSync(specPath, JSON.stringify({ feature_name: "x", input_shape: "x", output_shape: "x", error_cases: [] }));
+  const settings = path.join(gateTarget, ".claude/settings.json");
+  const settingsOrig = fs.readFileSync(settings, "utf8");
+
+  assert("wiring: passes with hooks intact", runScript(pgCheck, [specPath, "documenter"]) === 0, null);
+  fs.writeFileSync(settings, JSON.stringify({ hooks: { PreToolUse: [] } }));
+  assert("wiring: hard-fails when the guards are unwired",
+    runScript(pgCheck, [specPath, "documenter"]) === 1, null);
+  fs.rmSync(settings);
+  assert("wiring: only warns when there is no settings.json at all",
+    runScript(pgCheck, [specPath, "documenter"]) === 0, null);
+  fs.mkdirSync(path.dirname(settings), { recursive: true });
+  fs.writeFileSync(settings, settingsOrig);
+
+  // -- update refreshes every check init installs ----------------------------
+  // review-check.sh was in init's plan but not update's, so it was never refreshed.
+  const checksDir = path.join(gateTarget, ".agent/checks");
+  for (const f of fs.readdirSync(checksDir)) {
+    const abs = path.join(checksDir, f);
+    fs.writeFileSync(abs, fs.readFileSync(abs, "utf8") + "#STALE_MARKER");
+  }
+  await captureAll(async () => update({ cwd: gateTarget, flags: { skipSelfUpdate: true, allowScopeChange: true } }));
+  const stillStale = fs.readdirSync(checksDir)
+    .filter((f) => fs.readFileSync(path.join(checksDir, f), "utf8").includes("STALE_MARKER"));
+  assert("wiring: update refreshes every installed check", stillStale.length === 0, stillStale);
+
+  // -- parser conformance: scope.js vs scope-lib.sh --------------------------
+  // Twin implementations of one rule in two languages. The shell copy is what the hook
+  // enforces, so the JS copy must never see fewer globs than it does.
+  const slib = path.join(gateTarget, ".agent/checks/scope-lib.sh");
+  const NL = "\n";
+  const corpus = {
+    "block list": "scope:" + NL + "  may_create:" + NL + "  - src/**" + NL + "  - lib/**" + NL + "  may_modify: []" + NL,
+    "both populated": "scope:" + NL + "  may_create:" + NL + "  - a/**" + NL + "  may_modify:" + NL + "  - b/**" + NL,
+    "all empty": "scope:" + NL + "  may_create: []" + NL + "  may_modify: []" + NL,
+    "quoted values": "scope:" + NL + "  may_create:" + NL + '  - "q/**"' + NL + "  may_modify: []" + NL,
+    "key after list": "scope:" + NL + "  may_create:" + NL + "  - a/**" + NL + "  may_modify: []" + NL + "handoff_to: tester" + NL,
+    "no scope block": "role: reviewer" + NL + "responsibility: none" + NL,
+    "deep indent": "scope:" + NL + "    may_create:" + NL + "    - deep/**" + NL + "    may_modify: []" + NL,
+    "keys outside scope": "may_create:" + NL + "- loose/**" + NL + "scope:" + NL + "  may_create:" + NL + "  - inner/**" + NL,
+    "blank line in list": "scope:" + NL + "  may_create:" + NL + "  - a/**" + NL + NL + "  may_modify:" + NL + "  - b/**" + NL,
+    "root and dotfiles": "scope:" + NL + "  may_create:" + NL + "  - .cursorrules" + NL + "  - README.md" + NL + "  may_modify: []" + NL,
+  };
+  for (const [name, yaml] of Object.entries(corpus)) {
+    const f = path.join(gateTarget, "corpus.yaml");
+    fs.writeFileSync(f, yaml);
+    let shellOut = "";
+    try {
+      shellOut = execSync("bash -c 'source \"" + slib + "\"; scope_role_patterns \"" + f + "\"'", { encoding: "utf8" });
+    } catch {
+      shellOut = "";
+    }
+    const shellGlobs = shellOut.split(NL).map((x) => x.trim()).filter(Boolean).sort();
+    const jsGlobs = writableGlobs(parseRoleScope(yaml));
+    const jsSet = new Set(jsGlobs);
+    const missed = shellGlobs.filter((g) => !jsSet.has(g));
+    assert("conformance: js sees everything the shell does - " + name,
+      missed.length === 0, { shell: shellGlobs, js: jsGlobs, missed });
+  }
+}
+
+
+
+async function suiteStreaming() {
+  process.stdout.write("\n[streaming]\n");
+
+  const A = require("../lib/providers/anthropic");
+  const { extractSseEvents, createStreamMessage, applyStreamEvent, finalizeStreamMessage, parseResponse } = A;
+
+  // Feed frames a few bytes at a time — a chunk boundary inside a frame is the
+  // normal case on a real socket, not an edge case.
+  function feed(frames, chunkSize) {
+    const raw = frames.map((f) => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join("");
+    const msg = createStreamMessage();
+    let buf = "";
+    for (let i = 0; i < raw.length; i += chunkSize) {
+      buf += raw.slice(i, i + chunkSize);
+      const { events, rest } = extractSseEvents(buf);
+      buf = rest;
+      for (const ev of events) applyStreamEvent(msg, ev);
+    }
+    return finalizeStreamMessage(msg);
+  }
+
+  const happy = [
+    { type: "message_start", message: { model: "claude-opus-5", usage: { input_tokens: 1200, cache_read_input_tokens: 1024 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+    { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "pondering" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "text" } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Hello " } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "world" } },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 88 } },
+    { type: "message_stop" },
+  ];
+
+  for (const size of [1, 7, 4096]) {
+    const r = parseResponse(feed(happy, size));
+    assert(`stream: text assembled at ${size}-byte chunks`, r.output === "Hello world", r.output);
+  }
+
+  const r = parseResponse(feed(happy, 7));
+  assert("stream: skips the leading thinking block", r.output === "Hello world", r.output);
+  assert("stream: model from message_start", r.model === "claude-opus-5", r.model);
+  assert("stream: input tokens carried", r.usage.input_tokens === 1200, r.usage);
+  assert("stream: cache reads reported", r.usage.cache_read_input_tokens === 1024, r.usage);
+  assert("stream: output tokens from message_delta", r.usage.output_tokens === 88, r.usage);
+
+  // A refusal is HTTP 200 with a stop_reason, so it must not read as empty output.
+  const refused = feed([
+    { type: "message_start", message: { model: "claude-opus-5", usage: { input_tokens: 10 } } },
+    { type: "message_delta", delta: { stop_reason: "refusal", stop_details: { category: "cyber", explanation: "nope" } }, usage: { output_tokens: 0 } },
+  ], 5);
+  let threw = null;
+  try { parseResponse(refused); } catch (e) { threw = e.message; }
+  assert("stream: refusal throws", threw !== null, threw);
+  assert("stream: refusal names the category", threw && threw.includes("cyber"), threw);
+
+  threw = null;
+  try {
+    feed([{ type: "message_start", message: {} }, { type: "error", error: { type: "overloaded_error", message: "overloaded" } }], 5);
+  } catch (e) { threw = e.message; }
+  assert("stream: error event throws", threw !== null && threw.includes("overloaded"), threw);
+
+  // Index holes: only block 3 ever starts, so content has gaps before compaction.
+  const holed = feed([
+    { type: "message_start", message: { model: "claude-opus-5", usage: { input_tokens: 5 } } },
+    { type: "content_block_start", index: 3, content_block: { type: "thinking" } },
+    { type: "content_block_delta", index: 3, delta: { type: "thinking_delta", thinking: "..." } },
+    { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 64000 } },
+  ], 9);
+  assert("stream: index holes compacted", holed.content.length === 1, holed.content.length);
+  threw = null;
+  try { parseResponse(holed); } catch (e) { threw = e.message; }
+  assert("stream: thinking-only response throws", threw !== null, threw);
+  assert("stream: max_tokens gets an actionable message",
+    threw && threw.includes("max_tokens"), threw);
+
+  // A malformed frame must not take the run down.
+  const mixed = extractSseEvents('data: {bad json\n\ndata: {"type":"ping"}\n\n');
+  assert("stream: malformed frame skipped, good one kept",
+    mixed.events.length === 1 && mixed.events[0].type === "ping", mixed.events);
+  assert("stream: incomplete trailing frame is buffered, not parsed",
+    extractSseEvents('data: {"type":"ping"}\n\ndata: {"typ').rest.startsWith("data:"), null);
+  assert("stream: CRLF line endings handled",
+    extractSseEvents('data: {"type":"ping"}\r\n\r\n').events.length === 1, null);
+  assert("stream: [DONE] sentinel ignored", extractSseEvents("data: [DONE]\n\n").events.length === 0, null);
+
+  // The request itself
+  const body = A.buildRequest({ system: "s", user: "u", effort: "xhigh" });
+  assert("stream: adaptive thinking set", body.thinking && body.thinking.type === "adaptive", body.thinking);
+  assert("stream: effort nested in output_config", body.output_config.effort === "xhigh", body.output_config);
+  assert("stream: system carries a cache breakpoint",
+    body.system[0].cache_control.type === "ephemeral", body.system[0]);
+  assert("stream: max_tokens raised for streaming", A.DEFAULT_MAX_TOKENS === 64000, A.DEFAULT_MAX_TOKENS);
+  assert("stream: no budget_tokens (rejected on current models)",
+    !("budget_tokens" in body.thinking), body.thinking);
+  let effortErr = null;
+  try { A.buildRequest({ system: "s", user: "u", effort: "extreme" }); } catch (e) { effortErr = e.message; }
+  assert("stream: invalid effort rejected in buildRequest", effortErr !== null, effortErr);
+
+  // openai: the same blind-index bug the anthropic provider had
+  const O = require("../lib/providers/openai");
+  assert("openai: default model is the documented pin", O.DEFAULT_MODEL === "gpt-4o", O.DEFAULT_MODEL);
+}
+
 async function suiteScopeHardening() {
   process.stdout.write("\n[scope-hardening]\n");
 
@@ -1010,6 +1582,229 @@ async function suiteScopeHardening() {
   assert("post-generate: generator source change passes scope check", generatorOutcome === 0, generatorOutcome);
 }
 
+async function suiteEffort() {
+  process.stdout.write("\n[effort + provider]\n");
+
+  const T = require("../lib/util/templates");
+  const anthropic = require("../lib/providers/anthropic");
+
+  // ---- per-role effort ----
+  // Default API effort is "high", so medium/low are genuine reductions and xhigh is
+  // spent only where the reasoning pays for itself.
+  const EXPECTED = {
+    generator: "high",
+    integrator: "medium",
+    tester: "medium",
+    reviewer: "high",
+    debugger: "xhigh",
+    documenter: "low",
+    security: "xhigh",
+  };
+  for (const role of T.ROLES) {
+    const yaml = T.roleYaml(role, "pragmatist", { language: "javascript" });
+    const got = (yaml.match(/^effort:\s*(\S+)$/m) || [])[1];
+    assert(`effort: ${role} declares ${EXPECTED[role]}`, got === EXPECTED[role], got);
+  }
+  assert(
+    "effort: every declared value is one the API accepts",
+    T.ROLES.every((r) => {
+      const v = (T.roleYaml(r, "pragmatist", { language: "javascript" }).match(/^effort:\s*(\S+)$/m) || [])[1];
+      return anthropic.VALID_EFFORT.has(v);
+    })
+  );
+
+  // ---- request shape ----
+  const req = anthropic.buildRequest({ system: "SYS", user: "USR", effort: "xhigh" });
+  assert("provider: defaults to claude-opus-5", req.model === "claude-opus-5", req.model);
+  assert("provider: sends adaptive thinking", req.thinking && req.thinking.type === "adaptive", req.thinking);
+  // budget_tokens is rejected outright on current models — it must never come back.
+  assert("provider: sends no budget_tokens", !("budget_tokens" in (req.thinking || {})), req.thinking);
+  assert("provider: effort goes inside output_config", req.output_config && req.output_config.effort === "xhigh", req.output_config);
+  assert("provider: omits output_config when no effort given",
+    !("output_config" in anthropic.buildRequest({ system: "S", user: "U" })));
+  // The contract prefix is byte-identical across runs of a role, so it carries the
+  // cache breakpoint and the volatile task spec stays out of it.
+  assert("provider: system is a cacheable block array", Array.isArray(req.system), typeof req.system);
+  assert("provider: system block has a cache breakpoint",
+    req.system[0].cache_control && req.system[0].cache_control.type === "ephemeral", req.system[0]);
+  assert("provider: task spec stays in messages, not the cached prefix",
+    req.messages[0].content === "USR" && !JSON.stringify(req.system).includes("USR"));
+  assert("provider: max_tokens leaves room for thinking tokens", req.max_tokens >= 32000, req.max_tokens);
+  let threw = null;
+  try { anthropic.buildRequest({ system: "S", user: "U", effort: "turbo" }); } catch (e) { threw = e.message; }
+  assert("provider: rejects an invalid effort value", threw !== null && /invalid effort/.test(threw), threw);
+
+  // ---- response parsing ----
+  // With thinking on, content[0] is a thinking block; indexing it blindly returned undefined.
+  const withThinking = anthropic.parseResponse({
+    model: "claude-opus-5",
+    stop_reason: "end_turn",
+    content: [{ type: "thinking", thinking: "" }, { type: "text", text: "real answer" }],
+    usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 900, cache_creation_input_tokens: 7 },
+  });
+  assert("provider: skips thinking blocks to find the text", withThinking.output === "real answer", withThinking.output);
+  assert("provider: reports cache reads", withThinking.usage.cache_read_input_tokens === 900, withThinking.usage);
+  assert("provider: reports cache writes", withThinking.usage.cache_creation_input_tokens === 7, withThinking.usage);
+
+  const multi = anthropic.parseResponse({
+    stop_reason: "end_turn",
+    content: [{ type: "text", text: "part one" }, { type: "text", text: "part two" }],
+    usage: {},
+  });
+  assert("provider: joins multiple text blocks", multi.output === "part one\npart two", multi.output);
+
+  let refusal = null;
+  try {
+    anthropic.parseResponse({ stop_reason: "refusal", stop_details: { category: "cyber", explanation: "nope" }, content: [] });
+  } catch (e) { refusal = e.message; }
+  assert("provider: a refusal throws rather than reading as empty output",
+    refusal !== null && /declined/.test(refusal) && /cyber/.test(refusal), refusal);
+
+  let empty = null;
+  try { anthropic.parseResponse({ stop_reason: "max_tokens", content: [{ type: "thinking", thinking: "" }] }); }
+  catch (e) { empty = e.message; }
+  assert("provider: a text-less response names max_tokens as the cause",
+    empty !== null && /max_tokens/.test(empty), empty);
+
+  // ---- effort resolution precedence, end to end through run() ----
+  const target = fixture("effort-target", {
+    "package.json": JSON.stringify({ name: "e" }),
+    "src/a.js": "module.exports = 1;\n",
+  });
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+
+  // captureStdout only silences output; this collects it so the resolved effort line
+  // (and its source) can be asserted on.
+  async function runCollecting(flags) {
+    const origOut = process.stdout.write.bind(process.stdout);
+    const origErr = process.stderr.write.bind(process.stderr);
+    let text = "";
+    process.stdout.write = (c) => { text += c; return true; };
+    process.stderr.write = (c) => { text += c; return true; };
+    try {
+      const exit = await run({ cwd: target, flags });
+      return { text, exit };
+    } finally {
+      process.stdout.write = origOut;
+      process.stderr.write = origErr;
+    }
+  }
+
+  const roleDefault = await runCollecting({ role: "documenter", task: "t", dryRun: true });
+  assert("effort: role value is used when nothing overrides it",
+    /effort:\s+low \(role:documenter\)/.test(roleDefault.text),
+    (roleDefault.text.match(/effort:.*/) || [])[0]);
+
+  const debuggerRun = await runCollecting({ role: "debugger", task: "t", dryRun: true });
+  assert("effort: a different role resolves to its own value",
+    /effort:\s+xhigh \(role:debugger\)/.test(debuggerRun.text),
+    (debuggerRun.text.match(/effort:.*/) || [])[0]);
+
+  process.env.AGENT_EFFORT = "max";
+  const overridden = await runCollecting({ role: "documenter", task: "t", dryRun: true });
+  assert("effort: config/env overrides the role value",
+    /effort:\s+max \(config\)/.test(overridden.text),
+    (overridden.text.match(/effort:.*/) || [])[0]);
+
+  const flagWins = await runCollecting({ role: "documenter", task: "t", dryRun: true, effort: "low" });
+  assert("effort: an explicit flag outranks config",
+    /effort:\s+low \(flag\)/.test(flagWins.text),
+    (flagWins.text.match(/effort:.*/) || [])[0]);
+
+  process.env.AGENT_EFFORT = "turbo";
+  const bad = await runCollecting({ role: "documenter", task: "t", dryRun: true });
+  assert("effort: an invalid value fails the run", bad.exit === 1, bad.exit);
+  assert("effort: the failure names the offending value and its source",
+    /invalid effort "turbo".*config/.test(bad.text), (bad.text.match(/invalid effort.*/) || [])[0]);
+  delete process.env.AGENT_EFFORT;
+}
+
+async function suiteConfigRefresh() {
+  process.stdout.write("\n[config refresh]\n");
+
+  const { writeFile } = require("../lib/util/fs");
+  const T = require("../lib/util/templates");
+  const cfg = T.configYaml();
+
+  assert("config: docs are wrapped in markers", cfg.includes(T.CONFIG_DOCS_OPEN) && cfg.includes(T.CONFIG_DOCS_CLOSE));
+  // Settings must sit OUTSIDE the refreshed region, or uncommenting one would put it
+  // inside a block that gets rewritten.
+  const closeAt = cfg.indexOf(T.CONFIG_DOCS_CLOSE);
+  assert("config: example settings sit below the closing marker",
+    cfg.indexOf("# provider: claude-code") > closeAt && cfg.indexOf("# effort: high") > closeAt);
+  assert("config: docs advertise the current default model", cfg.includes("claude-opus-5"));
+
+  const dir = fixture("config-refresh", {});
+  function attempt(name, initial) {
+    const abs = path.join(dir, name);
+    fs.writeFileSync(abs, initial);
+    const res = writeFile(abs, cfg, { mode: "merge-config" });
+    return { action: res.action, after: fs.readFileSync(abs, "utf8") };
+  }
+
+  // Already current — must be a true no-op, not a rewrite.
+  const current = attempt("current.yaml", cfg);
+  assert("config: an up-to-date file is skipped", current.action === "skip", current.action);
+  assert("config: an up-to-date file is byte-identical", current.after === cfg);
+
+  // Marked file with real settings: docs refresh, settings survive, nothing duplicates.
+  const customized = cfg
+    .replace("# provider: claude-code", "provider: anthropic")
+    .replace("# model: claude-opus-5", "model: claude-sonnet-5");
+  const stale = customized.replace("# Uncomment and set values to override the defaults.", "# OBSOLETE DOC LINE");
+  const refreshed = attempt("customized.yaml", stale);
+  assert("config: stale doc text is replaced", !refreshed.after.includes("OBSOLETE DOC LINE"), refreshed.action);
+  assert("config: an active provider setting survives", /^provider: anthropic$/m.test(refreshed.after));
+  assert("config: an active model setting survives", /^model: claude-sonnet-5$/m.test(refreshed.after));
+  assert("config: settings are not duplicated",
+    (refreshed.after.match(/^provider:/gm) || []).length === 1,
+    (refreshed.after.match(/^provider:/gm) || []).length);
+  const abs = path.join(dir, "customized.yaml");
+  const once = fs.readFileSync(abs, "utf8");
+  writeFile(abs, cfg, { mode: "merge-config" });
+  assert("config: a second refresh changes nothing", fs.readFileSync(abs, "utf8") === once);
+
+  // Pre-markers file that is still pristine boilerplate — safe to regenerate, and this
+  // is the path that carries stale defaults forward for repos initialized long ago.
+  const legacyPristine = attempt("legacy.yaml", "# .agent/config.yaml — orchestrator configuration.\n# model: claude-opus-4-7\n");
+  assert("config: pristine legacy file is regenerated", legacyPristine.action === "overwrite", legacyPristine.action);
+  assert("config: regeneration drops the stale model id", !legacyPristine.after.includes("claude-opus-4-7"));
+  assert("config: regeneration adds the markers", legacyPristine.after.includes(T.CONFIG_DOCS_OPEN));
+
+  // Pre-markers file that the user has actually configured — never touch it.
+  const legacyBody = "# .agent/config.yaml\n# model: claude-opus-4-7\nprovider: anthropic\n";
+  const legacyActive = attempt("legacy-active.yaml", legacyBody);
+  assert("config: legacy file with settings is skipped", legacyActive.action === "skip", legacyActive.action);
+  assert("config: legacy file with settings is untouched", legacyActive.after === legacyBody);
+
+  const halfBody = T.CONFIG_DOCS_OPEN + "\n# no closing marker\nprovider: openai\n";
+  const half = attempt("half.yaml", halfBody);
+  assert("config: half a marker pair is skipped", half.action === "skip", half.action);
+  assert("config: half a marker pair is untouched", half.after === halfBody);
+
+  // ---- end to end through update() ----
+  const target = fixture("config-update", { "package.json": JSON.stringify({ name: "c" }) });
+  await captureStdout(async () => init({ cwd: target, flags: {} }));
+  const cfgPath = path.join(target, ".agent/config.yaml");
+  // Simulate a repo whose docs are stale and whose owner has picked a provider.
+  fs.writeFileSync(
+    cfgPath,
+    fs.readFileSync(cfgPath, "utf8")
+      .replace("claude-opus-5", "claude-opus-4-7")
+      .replace("# provider: claude-code", "provider: anthropic")
+  );
+  await captureStdout(async () => update({ cwd: target, flags: {} }));
+  const updated = fs.readFileSync(cfgPath, "utf8");
+  assert("config: update refreshes stale docs in place", !updated.includes("claude-opus-4-7"), updated.match(/claude-opus[^\s]*/g));
+  assert("config: update preserves the user's provider", /^provider: anthropic$/m.test(updated));
+
+  // --force must not reach config.yaml — a lost provider choice is worse than a stale comment.
+  fs.writeFileSync(cfgPath, updated.replace("provider: anthropic", "provider: openai"));
+  await captureStdout(async () => update({ cwd: target, flags: { force: true } }));
+  assert("config: --force still preserves the user's setting",
+    /^provider: openai$/m.test(fs.readFileSync(cfgPath, "utf8")));
+}
+
 async function suiteVersion() {
   process.stdout.write("\n[version]\n");
 
@@ -1070,6 +1865,11 @@ async function suiteVersion() {
     await suiteMap();
     await suiteHooks();
     await suiteScopeHardening();
+    await suiteRoleInference();
+    await suiteScopeGuard();
+    await suiteStreaming();
+    await suiteEffort();
+    await suiteConfigRefresh();
     await suiteVersion();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);

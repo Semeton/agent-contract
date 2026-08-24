@@ -10,12 +10,12 @@
 # after init, you just write the prompt — the contract does the rest
 ❯ fix the null check in payroll invoicing
 
-contract ▸ booted · role: generator · scope: src/payroll/**
+contract ▸ active · role: integrator (inferred) · scope: src/payroll/**
 
 agent ▸ Edit  src/payroll/invoice.ts          ✓ allowed
 agent ▸ Edit  src/payroll/invoice.test.ts     ✓ allowed
 agent ▸ Edit  src/auth/session.ts             ✗ BLOCKED
-  scope-check: src/auth/session.ts is outside role 'generator'
+  scope-check: src/auth/session.ts is outside role 'integrator'
   scope (src/payroll/**).  exit 2
 
 ✓ 1 fix shipped. 0 files touched outside scope.
@@ -34,11 +34,11 @@ Prefer no global install? `npx @semeton/agent-contract init` does it in one shot
 
 ## How it works
 
-Five gates sit between a prompt and your codebase. Each is a shell script that exits non-zero on a violation — the orchestrator reads exit codes, not promises.
+Five gates sit between a prompt and your codebase. Four of them are shell scripts that exit non-zero on a violation — the orchestrator reads exit codes, not promises.
 
 | # | Gate | What it does |
 |---|---|---|
-| 1 | **Boot** | The agent reads the contract before your source: latest handoff → `manifest.yaml` → codebase map → its role. |
+| 1 | **Orient** | An always-on shim states the enforced rules and points at the contract — `manifest.yaml`, codebase map, conventions, prior handoffs. No mandated reading order; the agent reads what the task needs. |
 | 2 | **Declare scope** | `pre-generate.sh` validates the task has what it needs, then records the active role — which arms the enforcement hook. |
 | 3 | **Enforce live** | A `PreToolUse` hook checks every Write/Edit against the role's allowed paths. Out-of-scope writes are blocked before they land. |
 | 4 | **Verify** | `post-generate.sh` runs the right linter, type-checker and tests for your stack, plus your `conventions.yaml` gates. |
@@ -112,7 +112,7 @@ The [full reference](docs/reference.md) covers everything in depth:
 
 - [Commands](docs/reference.md#usage) — `init`, `update`, `detect`, `run` with every flag
 - [Enforcement model](docs/reference.md#enforcement-model) — the four layers, contract-controlled files, what's guaranteed vs. best-effort
-- [Session continuity](docs/reference.md#session-continuity) — boot sequence, codebase map, handoff notes
+- [Session continuity](docs/reference.md#session-continuity) — the always-on shim, codebase map, handoff notes
 - [Personas & presets](docs/reference.md#personas) — `architect`/`vibecoder`/`lead`/`pragmatist` and convention starting points
 - [Token management](docs/reference.md#token-management), [conventions enforcement](docs/reference.md#conventions-enforcement), and the [programmatic API](docs/reference.md#programmatic-api)
 

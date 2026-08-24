@@ -73,7 +73,116 @@ agent-contract init --cwd ../other-repo
 
 ### Update
 
-Always refreshes: `stack.yaml`, `codebase-map.md`, all check scripts, and all role YAMLs (roles are declarative output derived from stack detection, not user-edited config). Leaves `conventions.yaml`, `manifest.yaml`, `config.yaml`, and templates untouched — overwrite templates with `--force`:
+Always refreshes: `stack.yaml`, `codebase-map.md`, all check scripts, and all role YAMLs (roles are declarative output derived from stack detection, not user-edited config).
+
+Refreshes **in place**, preserving anything you wrote: the shim block in `CLAUDE.md` / `AGENTS.md` / `.cursorrules` / `.github/copilot-instructions.md`, and the documentation block in `config.yaml`. Both are delimited by markers; content outside them is never rewritten, so an uncommented `provider:` or your own notes above the shim survive. A `config.yaml` written before the markers existed is regenerated only if it holds no active settings — if you have configured something, it is left alone entirely. `config.yaml` is never touched by `--force` either; losing a provider choice is worse than carrying a stale comment.
+
+**Scope changes need consent.** Role YAMLs are generated from `lib/util/templates.js`, which
+lives inside the `lib/**` glob an integrator-scoped agent may modify — so "edit the generator,
+re-run `update`" was a way for a session to grant itself any scope it liked. `update` now diffs
+every regenerated role against the one on disk and refuses when a role would gain a writable or
+deletable glob:
+
+```
+      WIDENS role scope:
+        + .agent/roles/integrator.yaml  writable: bin/**
+
+      refusing to widen a role's scope without explicit consent.
+      Review the paths above. If they are what you want, re-run with:
+        agent-contract update --allow-scope-change
+```
+
+It exits 1 and writes nothing. Narrowing a scope is always allowed and never prompts. `--force`
+carries the same consent, since it already means overwrite-the-contract — without that, a
+corrupted role file could not be repaired (an unparseable scope reads as empty, so restoring it
+looks like a widening).
+
+Both flags are blocked inside an agent session by `bash-write-guard.sh`, so consent has to come
+from a human terminal or a human-run CI step. A guard a session can wave through itself is
+decoration.
+
+**Enforcement code is guarded the same way — but only where it needs to be.** Every check
+script is regenerated from the package's templates, so if those templates are editable, so are
+the guards. Whether they are editable depends on where the tool lives:
+
+| Where `lib/util/templates.js` lives | Plain `update` | Why |
+|---|---|---|
+| Installed package, outside the repo (normal) | ships new checks freely | Templates are upstream; no role scope reaches them. This is the self-update path. |
+| Inside the repo — self-hosted or vendored | refuses without consent | An agent with `src/**`/`lib/**` scope can rewrite the guards, and plain `update` would deploy them. |
+
+**Role inference.** Blocking every source write until `pre-generate.sh` had run cost a turn at
+the start of any session not dispatched through `agent-contract run`. With no active role,
+`scope-check.sh` now derives one from the target:
+
+| Target | Resolves against | Result |
+|---|---|---|
+| existing `lib/x.js` | `may_modify` | infers `integrator` |
+| existing `test/x.js` | `may_modify` | infers `tester` |
+| existing `README.md`, `docs/**` | `may_modify` | infers `documenter` |
+| **new** `lib/x.js` | `may_create` | **blocked** — `generator` declares `inputs_required` |
+| new `test/x.js`, `docs/x.md` | `may_create` | infers `tester` / `documenter` |
+| `package.json`, `Makefile` | either | blocked — no role covers it |
+
+Existence is what disambiguates: editing a file is a modification, creating one is a creation,
+and the two keys rarely overlap. A role declaring `inputs_required` is never inferred, so
+generating new source still requires the spec gate.
+
+This relaxes ceremony, not enforcement. The chosen role's globs are still checked on every
+write, so inference can only pick a role that would have allowed the write anyway — an inferred
+`tester` still cannot write `lib/`. An explicit role is never overridden, and
+contract-controlled paths are rejected before inference runs. The stderr note
+(`scope-check: role inferred=integrator path=lib/a.js basis=may_modify`) keeps it visible.
+
+**Writes outside the repo.** A repo-level contract does not police the whole filesystem, and
+`scope-check.sh` still allows writes to tmp dirs, scratch space and sibling projects. Two
+exceptions are enforced at any path, because they decide whether the contract runs at all:
+an installed `agent-contract/lib/**` or `agent-contract/bin/**`, and `.claude/settings*.json`.
+Without these, any target repo could reach the globally installed CLI, tamper with the
+templates, and re-run `update`.
+
+**Consent is checked as a terminal property, not a command string.** `update` refuses
+`--allow-scope-change` and `--force` when stdin is not a TTY. Matching the command string can
+never establish that a human asked — `F=--force; agent-contract update $F` defeats any regex —
+so the decision is made by the program receiving the flag. An agent's Bash tool has no
+controlling terminal; your shell does.
+
+CI has no TTY either, so there is one documented hatch:
+
+```bash
+AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1 agent-contract update --allow-scope-change
+```
+
+Anyone who can set that in a CI config is a human with write access to the repo. Inside an
+agent session `bash-write-guard.sh` blocks the variable outright, so the obvious spelling is
+still refused. Set it in test suites and scripts that drive `update` programmatically.
+
+**Drift is detected, not just prevented.** `pre-generate.sh` hard-fails when
+`.claude/settings.json` exists but no longer references `scope-check.sh` and
+`bash-write-guard.sh` — unwired hooks silently turn every scope rule into a suggestion. A
+missing settings.json only warns (a Cursor or Copilot repo never had them). `agent-contract
+status` prints the same wiring check, plus which check scripts differ from what the installed
+templates would emit and which role scopes are wider on disk than the template produces:
+
+```
+enforcement:
+  hooks:      wired (scope-check, bash-write-guard, write-handoff)
+  checks:     DRIFTED — pre-generate.sh, bash-write-guard.sh
+              run `agent-contract update` to reconcile (out-of-band)
+  roles:      no out-of-band scope grants
+```
+
+Worth being plain about the limit: an attacker who has already unwired the hooks has won. This
+is here so that a human, or a CI step running `status`, notices — and so ordinary staleness
+(a repo initialized against an older version) stops being invisible.
+
+**What is still best-effort.** The `bash-write-guard.sh` regexes remain pattern matches and are
+now the *secondary* layer — they catch literal forms early with a clear message, while the TTY
+gate is what actually holds. `post-generate.sh`'s diff check is the backstop for any change
+however it was made. `lib/util/scope.js` and the emitted `checks/scope-lib.sh` are still two
+implementations of one rule, though a conformance test over adversarial YAML shapes now fails
+the build if the JS copy ever sees fewer globs than the shell one.
+
+Leaves `conventions.yaml`, `manifest.yaml`, and templates untouched — overwrite templates with `--force`:
 
 ```bash
 # Check for a newer version of agent-contract, install it, then update the project
@@ -87,6 +196,10 @@ agent-contract update --dry-run
 
 # Skip the npm version check (useful in CI or offline environments)
 agent-contract update --skip-self-update
+
+# Consent to roles gaining writable paths (see "Scope changes need consent" below).
+# Blocked inside an agent session — run this from your own terminal.
+agent-contract update --allow-scope-change
 ```
 
 **Self-update flow:** when a newer version is published to npm, `agent-contract update` installs it globally and re-runs the update command with the new binary — so you always get the latest templates, checks, and shim content without a separate upgrade step.
@@ -121,10 +234,46 @@ agent-contract run --role generator --task "..." --provider echo
 ```
 
 **Provider auto-detection order** (first available wins):
-1. `anthropic` — if `ANTHROPIC_API_KEY` is set
-2. `openai` — if `OPENAI_API_KEY` is set
-3. `claude-code` — if the `claude` CLI is installed (Claude Pro/Max, no API key needed)
+1. `claude-code` — if the `claude` CLI is installed (Claude Pro/Max, no API key needed)
+2. `anthropic` — if `ANTHROPIC_API_KEY` is set
+3. `openai` — if `OPENAI_API_KEY` is set
 4. `echo` — prints the assembled prompt, calls nothing (dry run)
+
+An explicit `--provider`, or `provider:` in `.agent/config.yaml`, overrides detection.
+
+**Reasoning effort.** Each role declares its own `effort` — the depth the model reasons at
+before answering. The Anthropic API defaults to `high`, so the cheap roles cost less than
+they used to and only the two hardest-reasoning roles cost more:
+
+| Role | Effort |
+|---|---|
+| `documenter` | `low` |
+| `integrator`, `tester` | `medium` |
+| `generator`, `reviewer` | `high` |
+| `debugger`, `security` | `xhigh` |
+
+Precedence is `AGENT_EFFORT` env var → `effort:` in `.agent/config.yaml` → the role's own
+value. An unrecognised value fails the run and names both the value and where it came from.
+Valid values are `low`, `medium`, `high`, `xhigh`, `max`; the setting applies to the
+`anthropic` provider (the `claude-code` CLI takes its own settings, and `openai` ignores it).
+`--effort <level>` overrides it for a single run.
+
+**What the `anthropic` provider sends.** `claude-opus-5` by default, adaptive thinking, the
+role's effort in `output_config`, and a cache breakpoint on the system prefix — the contract
+(stack + conventions + role) is byte-identical between runs of the same role, so it caches while
+the volatile task spec stays in `messages`. Requests **stream**, which is what makes a 64,000
+`max_tokens` safe: thinking tokens count against that ceiling, and a non-streaming call at this
+size risks an HTTP timeout before the model finishes. A safety decline arrives as HTTP 200 with
+`stop_reason: "refusal"` and is reported as an error naming the category, not as empty output.
+
+**What is deliberately not writable.** `package.json` (and its per-stack equivalents) sits in no
+role's scope. It is the dependency manifest, so an agent that can edit it can add a dependency —
+that stays a human review step. Version bumps go through
+`npm version <level> --no-git-tag-version`, a release action rather than a task action. The
+agent-facing shims (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`,
+`.github/copilot-instructions.md`) *are* owned by the documenter role: rewriting one disables no
+enforcement, since the hooks are the enforcement and the shim block is marker-delimited and
+regenerated by `update`, so tampering inside it is transient and shows up in a diff.
 
 ## Session continuity
 
@@ -132,17 +281,20 @@ One of the core problems with AI agents is that context is lost between sessions
 
 `agent-contract` addresses this at three levels:
 
-### 1. Boot sequence (always enforced)
+### 1. The always-on shim
 
-Every shim file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`) now contains a mandatory boot sequence the agent must run at the start of every session:
+Every shim file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`) carries a marked block stating the rules the hooks mechanically enforce:
 
-1. Check `.agent/memory/` for any `handoff-*.md` files. Read the most recent one before proceeding.
-2. Read `.agent/manifest.yaml` to load the full contract.
-3. Read `.agent/memory/codebase-map.md` — use this as the index. Do not read raw source files before consulting the map.
-4. Load the relevant role from `.agent/roles/<role>.yaml`.
-5. Declare the role by running `.agent/checks/pre-generate.sh <task-spec.json> <role>` before generating any code — this validates the spec **and** writes `.agent/session/active-role.txt`, enabling the scope-enforcement hooks. `active-role.txt` is contract-controlled, so hand-editing it is blocked; running `pre-generate.sh` (or a dispatcher) is the sanctioned way to set the role.
+- **Declare a role before writing source** — run `.agent/checks/pre-generate.sh <task-spec.json> <role>`. This validates the spec **and** writes `.agent/session/active-role.txt`, which enables the scope-enforcement hooks. `active-role.txt` is contract-controlled, so hand-editing it is blocked; running `pre-generate.sh` (or a dispatcher) is the sanctioned way to set the role. With no role declared the guard falls back to inference (below) and blocks when the answer is not unique.
+- **Stay inside the role's scope** — `.agent/roles/<role>.yaml` lists the writable globs; an empty list means read-only.
+- **Contract files are off-limits in-session** — `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt`, `.claude/settings*`.
+- **Fix only what was asked**, **ask when inputs are ambiguous**, and **log non-trivial decisions** to `.agent/memory/decisions.jsonl`.
 
-The contract is declared **non-optional** — it applies to every session, every task, every model, without needing to be mentioned in the prompt.
+The shim then lists the context that exists — manifest, codebase map, conventions, prior handoffs — and states explicitly that there is **no required reading order**.
+
+Earlier versions mandated a numbered boot sequence instead. It was dropped deliberately: it forced four or five tool calls and a role/spec/scope planning problem before the task was even read, which spends reasoning on contract compliance rather than the problem. Current models choose a reading order well on their own, and the hooks enforce the rules regardless of what the model chose to read.
+
+The contract is **non-optional** — it applies to every session, every task, every model, without needing to be mentioned in the prompt. The shim block is refreshed in place by `agent-contract update`, so a contract change reaches repos initialized long ago.
 
 ### 2. Codebase map
 
@@ -184,8 +336,8 @@ tests/
 @nestjs/core, @nestjs/typeorm, pg, redis
 
 ## Agent Usage Protocol
-1. Read this file BEFORE reading individual source files.
-2. Use the directory structure above to decide which files to read.
+An index, not required reading — use it when it saves a search, skip it when it does not.
+Paths and symbols here can go stale; grep before trusting one.
 ...
 ```
 
@@ -201,10 +353,10 @@ A handoff note is written:
 
 - **Automatically by the Stop hook** — the Claude Code `Stop` hook runs `write-handoff.sh` after every agent turn that produces git changes. The note is saved to `.agent/memory/handoff-done-{timestamp}.md` with the active role, changed files, and last 5 decisions. No model cooperation required; turns with no changes are silently skipped.
 - **At task completion** — after every successful `agent-contract run`, a note is saved to `.agent/memory/handoff-done-{timestamp}.md` with the role, task, token stats, and last 5 decisions.
-- **At 85% context window** — a banner is shown and a second note is saved to `.agent/memory/handoff-{timestamp}.md` (no `-done-` suffix). The boot sequence loads both formats since it matches `handoff-*.md`.
-- **By the agent directly** — the shim instructs agents (Claude Code, Cursor, etc.) to fill in `.agent/templates/handoff.md` and write it to `.agent/memory/` when a task is done, then tell you to start a fresh session.
+- **At 85% of the context window** — a banner is shown and a second note is saved to `.agent/memory/handoff-{timestamp}.md` (no `-done-` suffix). Both formats match `handoff-*.md`, so either is found when a session looks for prior state.
+- **By hand** — `.agent/templates/handoff.md` is there for a human or agent that wants to write one deliberately. It is no longer something the shim asks for on every task; the Stop hook already covers it without needing model cooperation.
 
-The boot sequence picks up the most recent handoff automatically, so the next session starts with full context.
+The shim lists prior handoffs among the available context, so the next session can pick up the most recent one.
 
 **Compaction:** `write-handoff.sh` keeps only the 5 most recent handoff files. Older ones are archived to `.agent/memory/handoff-archive.jsonl` (one JSON entry per file with `ts`, `role`, and `files` fields) and deleted. The archive runs in the background so it never adds latency to the session.
 
@@ -237,13 +389,23 @@ The handoff note contains the current role, task, token stats, the last 5 entrie
 
 | Model | Limit |
 |---|---|
-| claude-opus-4-8 / claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5 | 200,000 |
+| claude-opus-5 / claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 | 1,000,000 |
+| claude-sonnet-5 / claude-sonnet-4-6 | 1,000,000 |
+| claude-fable-5 / claude-mythos-5 | 1,000,000 |
+| claude-opus-4-5 / claude-haiku-4-5 | 200,000 |
 | claude-3-5-sonnet / claude-3-opus / claude-3-sonnet / claude-3-haiku | 200,000 |
 | gpt-4o / gpt-4o-mini / gpt-4-turbo | 128,000 |
 | gpt-3.5-turbo | 16,000 |
-| claude-code (CLI, estimated) | 200,000 |
+| claude-code (CLI, estimated) | 1,000,000 |
+| anything unrecognised | 100,000 |
 
-For providers that don't return exact token counts (claude-code CLI), usage is estimated at 1 token per 4 characters.
+Matching is by prefix, so a dated variant such as `claude-opus-4-6-20260101` resolves to its
+base model. An unrecognised model falls back to a deliberately conservative 100,000 so the
+thresholds fire early rather than late.
+
+On the `anthropic` provider the pre-flight size is an exact `count_tokens` call; everywhere
+else it is estimated at 1 token per 4 characters. The post-run figure always comes from the
+provider's reported usage when it returns one.
 
 ## Personas
 
@@ -288,7 +450,7 @@ your-repo/
 │   ├── manifest.yaml             ← single entrypoint (persona, stack refs, enforcement policy)
 │   ├── stack.yaml                ← auto-generated; language/framework facts + shell commands
 │   ├── conventions.yaml          ← engineering rules (paradigm, tone, module size, DB policy…)
-│   ├── config.yaml               ← provider/model config (provider, model; env vars override)
+│   ├── config.yaml               ← provider/model/effort config (env vars override; docs block refreshed by update)
 │   ├── roles/                    ← one YAML per role (always regenerated from stack detection)
 │   │   ├── generator.yaml
 │   │   ├── integrator.yaml
@@ -321,10 +483,10 @@ your-repo/
 │       └── active-role.txt                    ← set by pre-generate.sh/dispatcher; read by the guards (contract-controlled)
 ├── .claude/
 │   └── settings.json                          ← Claude Code hooks (PreToolUse ×2 + Stop)
-├── CLAUDE.md                                  ← shim with boot sequence → manifest
-├── AGENTS.md                                  ← shim with boot sequence → manifest
-├── .cursorrules                               ← shim with boot sequence → manifest
-└── .github/copilot-instructions.md           ← shim with boot sequence → manifest
+├── CLAUDE.md                                  ← shim: enforced rules + available context (marked, refreshed in place)
+├── AGENTS.md                                  ← shim (same block)
+├── .cursorrules                               ← shim (same block)
+└── .github/copilot-instructions.md           ← shim (same block)
 ```
 
 ## Design
