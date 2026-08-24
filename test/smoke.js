@@ -27,6 +27,11 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "agent-contract-test-"));
 // none, so it takes the documented CI escape hatch. Individual tests unset this to prove
 // the gate still bites.
 process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = "1";
+// PreToolUse blocks ONLY on exit 2. Every other non-zero code is a non-blocking hook
+// error and the tool call proceeds, so a guard exiting 1 refuses in words and permits
+// in fact. These assertions are what pins that down.
+const BLOCK = 2;
+
 let failures = 0;
 let passes = 0;
 
@@ -839,7 +844,7 @@ async function suiteHooks() {
     scopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/foo.ts"), content: "x" } })
   );
-  assert("scope-check: exits 1 when no active-role.txt (fail-closed)", noRoleCode === 1, noRoleCode);
+  assert("scope-check: exits 2 (blocks) when no active-role.txt (fail-closed)", noRoleCode === BLOCK, noRoleCode);
 
   // scope-check: no active-role.txt → writable .agent/ infra (memory/decisions/handoffs) still passes
   const noRoleAgentCode = runScriptWithInput(
@@ -862,7 +867,7 @@ async function suiteHooks() {
     scopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/service.ts"), content: "x" } })
   );
-  assert("scope-check: exits 1 when file is outside role scope", outOfScopeCode === 1, outOfScopeCode);
+  assert("scope-check: exits 2 (blocks) when file is outside role scope", outOfScopeCode === BLOCK, outOfScopeCode);
 
   // scope-check: unknown role file → fail-closed (declared role has no YAML → block source writes)
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "nonexistent-role\n");
@@ -870,7 +875,7 @@ async function suiteHooks() {
     scopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, "src/anything.ts"), content: "x" } })
   );
-  assert("scope-check: exits 1 when role YAML not found (fail-closed)", unknownRoleCode === 1, unknownRoleCode);
+  assert("scope-check: exits 2 (blocks) when role YAML not found (fail-closed)", unknownRoleCode === BLOCK, unknownRoleCode);
 
   // scope-check: always allows writes to .agent/ infrastructure regardless of role
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "tester\n");
@@ -963,7 +968,7 @@ async function suiteHooks() {
     gitScopeCheck, [],
     JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(gitTarget, "src/service.ts"), content: "x" } })
   );
-  assert("scope-check: quoted pattern blocks files outside scope", quotedOutOfScope === 1, quotedOutOfScope);
+  assert("scope-check: quoted pattern blocks files outside scope", quotedOutOfScope === BLOCK, quotedOutOfScope);
 
   // .agent/session/.gitignore created by init
   assert(
@@ -980,6 +985,82 @@ async function suiteHooks() {
     .flatMap((e) => e.hooks || [])
     .filter((h) => h.command && h.command.includes("scope-check.sh")).length;
   assert("hooks install: idempotent (scope-check not duplicated)", scopeHookCount === 1, scopeHookCount);
+}
+
+async function suiteHookContract() {
+  process.stdout.write("\n[hook contract]\n");
+
+  const T = require("../lib/util/templates");
+  const { installClaudeHooks } = require("../lib/util/hooks");
+
+  // PreToolUse blocks ONLY on exit 2. Anything else non-zero is a non-blocking hook
+  // error: Claude Code notes it and runs the tool anyway. A guard that exits 1 on a
+  // violation therefore prints a refusal and permits the write -- silently, and
+  // indistinguishably from "no violation found". This suite pins the contract.
+  const guards = {
+    "scope-check.sh": T.scopeCheckScript(),
+    "bash-write-guard.sh": T.bashWriteGuardScript(),
+  };
+  for (const [name, body] of Object.entries(guards)) {
+    const strayOnes = (body.match(/^\s*exit 1$/gm) || []).length;
+    const twos = (body.match(/^\s*exit 2$/gm) || []).length;
+    assert(`hook: ${name} has no bare 'exit 1'`, strayOnes === 0, strayOnes);
+    assert(`hook: ${name} blocks with 'exit 2'`, twos > 0, twos);
+    assert(`hook: ${name} still allows with 'exit 0'`,
+      /^\s*exit 0$/m.test(body), null);
+  }
+
+  // Scripts invoked directly or from CI keep exit 1 — the conventional failure code.
+  // Conflating the two conventions is how the bug above happened.
+  const direct = {
+    "review-check.sh": T.reviewCheck(),
+    "security-audit.sh": T.securityAuditCheck(),
+  };
+  for (const [name, body] of Object.entries(direct)) {
+    assert(`hook: ${name} (CI-invoked) still fails with exit 1`,
+      /^\s*exit 1$/m.test(body), null);
+  }
+
+  // Hook commands must not depend on the working directory. A script the shell cannot
+  // find exits 127, which is also non-blocking — the same silent failure mode.
+  const dir = fs.mkdtempSync(path.join(TMP, "hookfmt-"));
+  installClaudeHooks(dir, false);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude/settings.json"), "utf8"));
+  const commands = []
+    .concat(settings.hooks.PreToolUse || [], settings.hooks.Stop || [])
+    .flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert("hook: every command is registered", commands.length === 3, commands);
+  for (const cmd of commands) {
+    assert(`hook: cwd-independent path in ${cmd.split("/").pop()}`,
+      cmd.includes("$CLAUDE_PROJECT_DIR"), cmd);
+    assert(`hook: project dir is quoted in ${cmd.split("/").pop()}`,
+      cmd.includes('"$CLAUDE_PROJECT_DIR/'), cmd);
+  }
+  assert("hook: install is idempotent", installClaudeHooks(dir, false).action === "skip", null);
+
+  // End to end: a real violation must return exactly 2, not merely non-zero.
+  const repo = fixture("hook-exit", {
+    "package.json": JSON.stringify({ name: "he", version: "1.0.0" }),
+    "lib/a.js": "module.exports = 1;",
+    "docs/a.md": "# d",
+  });
+  await captureStdout(async () => init({ cwd: repo, flags: { yes: true } }));
+  const sc = path.join(repo, ".agent/checks/scope-check.sh");
+  const bw = path.join(repo, ".agent/checks/bash-write-guard.sh");
+  fs.writeFileSync(path.join(repo, ".agent/session/active-role.txt"), "documenter\n");
+
+  const w = (rel) => runScriptWithInput(sc, [], JSON.stringify({
+    tool_name: "Write", tool_input: { file_path: path.join(repo, rel) },
+  }));
+  assert("hook: out-of-scope write returns exactly 2", w("lib/a.js") === 2, w("lib/a.js"));
+  assert("hook: in-scope write returns 0", w("docs/a.md") === 0, w("docs/a.md"));
+
+  const b = (cmd) => runScriptWithInput(bw, [], JSON.stringify({
+    tool_name: "Bash", tool_input: { command: cmd },
+  }));
+  assert("hook: protected bash write returns exactly 2",
+    b("echo x > .agent/roles/generator.yaml") === 2, b("echo x > .agent/roles/generator.yaml"));
+  assert("hook: harmless bash returns 0", b("npm test") === 0, b("npm test"));
 }
 
 async function suiteRoleInference() {
@@ -1023,9 +1104,9 @@ async function suiteRoleInference() {
   // Creating resolves through may_create. New source belongs to generator, which
   // declares inputs_required — so the spec gate must still bite rather than infer.
   r = probe("lib/brand-new.js");
-  assert("infer: new source still requires a spec", r.code === 1 && r.role === null, r);
+  assert("infer: new source still requires a spec", r.code === BLOCK && r.role === null, r);
   r = probe("src/brand-new.ts");
-  assert("infer: new src/ also requires a spec", r.code === 1 && r.role === null, r);
+  assert("infer: new src/ also requires a spec", r.code === BLOCK && r.role === null, r);
 
   // New tests and docs are unambiguous among roles that need no spec.
   r = probe("test/new.test.js");
@@ -1035,9 +1116,9 @@ async function suiteRoleInference() {
 
   // Paths no role covers stay blocked, and nothing is persisted.
   r = probe("package.json");
-  assert("infer: uncovered existing path blocked", r.code === 1 && r.role === null, r);
+  assert("infer: uncovered existing path blocked", r.code === BLOCK && r.role === null, r);
   r = probe("Makefile");
-  assert("infer: uncovered new path blocked", r.code === 1 && r.role === null, r);
+  assert("infer: uncovered new path blocked", r.code === BLOCK && r.role === null, r);
 
   // Inference grants nothing beyond the role it picks.
   try { fs.rmSync(session); } catch {}
@@ -1048,14 +1129,14 @@ async function suiteRoleInference() {
   const afterInfer = runScriptWithInput(sc, [], JSON.stringify({
     tool_name: "Write", tool_input: { file_path: path.join(target, "lib/a.js") },
   }));
-  assert("infer: inferred tester still cannot write lib/", afterInfer === 1, afterInfer);
+  assert("infer: inferred tester still cannot write lib/", afterInfer === BLOCK, afterInfer);
 
   // An explicitly declared role is never overridden by inference.
   fs.writeFileSync(session, "documenter\n");
   assert("infer: explicit role still enforced",
     runScriptWithInput(sc, [], JSON.stringify({
       tool_name: "Write", tool_input: { file_path: path.join(target, "lib/a.js") },
-    })) === 1, null);
+    })) === BLOCK, null);
   assert("infer: explicit role still permitted in its own scope",
     runScriptWithInput(sc, [], JSON.stringify({
       tool_name: "Write", tool_input: { file_path: path.join(target, "docs/guide.md") },
@@ -1066,7 +1147,7 @@ async function suiteRoleInference() {
   assert("infer: never infers a role for a contract-controlled path",
     runScriptWithInput(sc, [], JSON.stringify({
       tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/roles/generator.yaml") },
-    })) === 1, null);
+    })) === BLOCK, null);
   assert("infer: no role persisted after a protected-path block",
     !fs.existsSync(session), null);
 
@@ -1196,12 +1277,12 @@ async function suiteScopeGuard() {
   const guard = path.join(target, ".agent/checks/bash-write-guard.sh");
   const bash = (cmd) => runScriptWithInput(guard, [], JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }));
   assert("scope: bash guard blocks --allow-scope-change",
-    bash("agent-contract update --allow-scope-change") === 1, null);
+    bash("agent-contract update --allow-scope-change") === BLOCK, null);
   assert("scope: bash guard blocks node-invoked --allow-scope-change",
-    bash("node bin/agent-contract.js update --cwd . --allow-scope-change") === 1, null);
-  assert("scope: bash guard blocks update --force", bash("agent-contract update --force") === 1, null);
-  assert("scope: bash guard blocks init --force", bash("agent-contract init --force") === 1, null);
-  assert("scope: bash guard blocks npx form", bash("npx agent-contract update --force") === 1, null);
+    bash("node bin/agent-contract.js update --cwd . --allow-scope-change") === BLOCK, null);
+  assert("scope: bash guard blocks update --force", bash("agent-contract update --force") === BLOCK, null);
+  assert("scope: bash guard blocks init --force", bash("agent-contract init --force") === BLOCK, null);
+  assert("scope: bash guard blocks npx form", bash("npx agent-contract update --force") === BLOCK, null);
   assert("scope: bash guard allows plain update", bash("agent-contract update") === 0, null);
   assert("scope: bash guard allows dry-run", bash("agent-contract update --dry-run") === 0, null);
   assert("scope: bash guard allows npm test", bash("npm test") === 0, null);
@@ -1216,13 +1297,13 @@ async function suiteScopeGuard() {
   const writeTo = (p) => runScriptWithInput(sc, [], JSON.stringify({ tool_name: "Write", tool_input: { file_path: p } }));
 
   assert("toolchain: blocks writes to an installed agent-contract lib",
-    writeTo("/usr/local/lib/node_modules/@semeton/agent-contract/lib/util/templates.js") === 1, null);
+    writeTo("/usr/local/lib/node_modules/@semeton/agent-contract/lib/util/templates.js") === BLOCK, null);
   assert("toolchain: blocks writes to an installed agent-contract bin",
-    writeTo("/opt/homebrew/lib/node_modules/agent-contract/bin/agent-contract.js") === 1, null);
+    writeTo("/opt/homebrew/lib/node_modules/agent-contract/bin/agent-contract.js") === BLOCK, null);
   assert("toolchain: blocks writes to its package.json",
-    writeTo("/usr/local/lib/node_modules/agent-contract/package.json") === 1, null);
+    writeTo("/usr/local/lib/node_modules/agent-contract/package.json") === BLOCK, null);
   assert("toolchain: blocks hook settings anywhere",
-    writeTo(path.join(os.homedir(), ".claude/settings.json")) === 1, null);
+    writeTo(path.join(os.homedir(), ".claude/settings.json")) === BLOCK, null);
   assert("toolchain: still allows unrelated out-of-repo writes",
     writeTo("/tmp/scratch-file.js") === 0, null);
   assert("toolchain: still allows a sibling project",
@@ -1236,7 +1317,7 @@ async function suiteScopeGuard() {
     slOrig.includes("scope_is_protected_abs"), null);
   fs.writeFileSync(slPath, slOrig.replace(/scope_is_protected_abs\(\)[\s\S]*?\n}\n/, ""));
   assert("toolchain: fails closed when scope-lib is stale",
-    writeTo("/usr/local/lib/node_modules/agent-contract/lib/util/templates.js") === 1, null);
+    writeTo("/usr/local/lib/node_modules/agent-contract/lib/util/templates.js") === BLOCK, null);
   assert("toolchain: stale scope-lib still allows unrelated paths",
     writeTo("/tmp/scratch-file.js") === 0, null);
   fs.writeFileSync(slPath, slOrig);
@@ -1313,9 +1394,9 @@ async function suiteScopeGuard() {
   const bwg = path.join(gateTarget, ".agent/checks/bash-write-guard.sh");
   const bash2 = (cmd) => runScriptWithInput(bwg, [], JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }));
   assert("consent: bash guard blocks setting the hatch",
-    bash2("AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1 agent-contract update") === 1, null);
+    bash2("AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1 agent-contract update") === BLOCK, null);
   assert("consent: bash guard blocks the hatch even without a subcommand",
-    bash2("export AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1") === 1, null);
+    bash2("export AGENT_CONTRACT_NONINTERACTIVE_CONSENT=1") === BLOCK, null);
 
   // -- enforcement wiring drift ---------------------------------------------
   const pgCheck = path.join(gateTarget, ".agent/checks/pre-generate.sh");
@@ -1515,7 +1596,7 @@ async function suiteScopeHardening() {
   ];
   for (const rel of protectedPaths) {
     const code = runScriptWithInput(scopeCheck, [], writeInput(rel));
-    assert(`scope-check: BLOCKS write to contract-controlled ${rel}`, code === 1, code);
+    assert(`scope-check: BLOCKS write to contract-controlled ${rel}`, code === BLOCK, code);
   }
 
   // Gap 0 regression: writable .agent infra (memory/decisions) still passes
@@ -1526,7 +1607,7 @@ async function suiteScopeHardening() {
   // reviewer declares may_create: [] / may_modify: [] → must not write source
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "reviewer\n");
   const reviewerCode = runScriptWithInput(scopeCheck, [], writeInput("src/whatever.ts"));
-  assert("scope-check: empty-scope role (reviewer) is fail-closed on source write", reviewerCode === 1, reviewerCode);
+  assert("scope-check: empty-scope role (reviewer) is fail-closed on source write", reviewerCode === BLOCK, reviewerCode);
   // restore a writing role for later
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "generator\n");
 
@@ -1541,7 +1622,7 @@ async function suiteScopeHardening() {
   ];
   for (const cmd of blockedCommands) {
     const code = runScriptWithInput(bashGuard, [], bashInput(cmd));
-    assert(`bash-write-guard: BLOCKS \`${cmd.slice(0, 42)}…\``, code === 1, code);
+    assert(`bash-write-guard: BLOCKS \`${cmd.slice(0, 42)}…\``, code === BLOCK, code);
   }
 
   // bash-write-guard must NOT block legitimate commands (low false-positive)
@@ -1865,6 +1946,7 @@ async function suiteVersion() {
     await suiteMap();
     await suiteHooks();
     await suiteScopeHardening();
+    await suiteHookContract();
     await suiteRoleInference();
     await suiteScopeGuard();
     await suiteStreaming();
