@@ -34,12 +34,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/semeton/agent-contract.git"
+    "url": "git+https://github.com/Semeton/agent-contract.git"
   },
   "bugs": {
-    "url": "https://github.com/semeton/agent-contract/issues"
+    "url": "https://github.com/Semeton/agent-contract/issues"
   },
-  "homepage": "https://github.com/semeton/agent-contract#readme",
+  "homepage": "https://github.com/Semeton/agent-contract#readme",
   "author": "semeton",
   "license": "MIT",
   "publishConfig": {
