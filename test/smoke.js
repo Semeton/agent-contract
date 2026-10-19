@@ -27,6 +27,10 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "agent-contract-test-"));
 // none, so it takes the documented CI escape hatch. Individual tests unset this to prove
 // the gate still bites.
 process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = "1";
+// The suite assumes no terminal. Run from an interactive shell, `init` would stop at its
+// preset/persona prompts — invisible, because tests capture stdout — and wait forever.
+// Pin both streams to non-interactive so `npm test` (and prepublishOnly) behave the same everywhere.
+for (const s of [process.stdin, process.stdout]) Object.defineProperty(s, "isTTY", { value: false, configurable: true });
 // PreToolUse blocks ONLY on exit 2. Every other non-zero code is a non-blocking hook
 // error and the tool call proceeds, so a guard exiting 1 refuses in words and permits
 // in fact. These assertions are what pins that down.
@@ -2055,6 +2059,132 @@ async function suiteVersion() {
   })().includes(PKG.version), null);
 }
 
+// Layout-aware scopes (lib/detect/layout.js), init's role handling, and hook wiring
+// through settings.local.json.
+async function suiteLayout() {
+  process.stdout.write("\n[layout]\n");
+  const readRole = (dir, role) => fs.readFileSync(path.join(dir, ".agent/roles", `${role}.yaml`), "utf8");
+  const writable = (dir, role, key) => {
+    const out = [];
+    let on = false;
+    for (const line of readRole(dir, role).split("\n")) {
+      if (/^\s*(may_create|may_modify|may_delete):/.test(line)) { on = line.includes(`${key}:`) && !line.includes("[]"); continue; }
+      const m = line.match(/^\s*-\s+(.+)$/);
+      if (on && m) out.push(m[1].replace(/"/g, "")); else on = false;
+    }
+    return out;
+  };
+
+  // 1. Next.js with a src/ directory: the canonical app/** etc. match nothing.
+  const nextSrc = fixture("layout-next-src", {
+    "package.json": JSON.stringify({ name: "n", dependencies: { next: "^15", react: "^19" } }),
+    "next.config.js": "module.exports = {};",
+    "src/app/page.tsx": "export default function P() {}",
+    "src/app/layout.tsx": "export default function L() {}",
+    "src/components/Button.tsx": "export const B = 1;",
+    "src/lib/db.ts": "export const db = 1;",
+    "src/lib/auth.ts": "export const a = 1;",
+  });
+  execSync("git init -q && git add -A", { cwd: nextSrc, stdio: "pipe" });
+  await captureStdout(() => init({ cwd: nextSrc, flags: {} }));
+  const nextMod = writable(nextSrc, "integrator", "may_modify");
+  assert("layout: Next src/ layout adds src/** to integrator", nextMod.includes("src/**"), nextMod);
+  assert("layout: Next src/ layout keeps canonical globs", nextMod.includes("app/**"), nextMod);
+  assert("layout: root config file added by name, not *.js", nextMod.includes("next.config.js") && !nextMod.includes("*.js"), nextMod);
+
+  // 2. Canonical Next layout: scopes exactly as before.
+  const nextApp = fixture("layout-next-app", {
+    "package.json": JSON.stringify({ name: "n", dependencies: { next: "^15" } }),
+    "app/page.tsx": "x", "app/layout.tsx": "x", "components/A.tsx": "x", "components/B.tsx": "x", "lib/c.ts": "x",
+  });
+  await captureStdout(() => init({ cwd: nextApp, flags: {} }));
+  assert("layout: canonical layout keeps the framework defaults only",
+    JSON.stringify(writable(nextApp, "integrator", "may_modify")) ===
+    JSON.stringify(["app/**", "pages/**", "components/**", "lib/**", "styles/**", "public/**"]),
+    writable(nextApp, "integrator", "may_modify"));
+
+  // 3. melos-style Dart monorepo: one lib/ per package.
+  const melos = fixture("layout-melos", {
+    "pubspec.yaml": "name: workspace\n", "melos.yaml": "name: ws\npackages: [packages/*, apps/*]\n",
+    "packages/a/pubspec.yaml": "name: a", "packages/a/lib/a.dart": "x", "packages/a/test/a_test.dart": "x",
+    "packages/b/pubspec.yaml": "name: b", "packages/b/lib/b.dart": "x",
+    "packages/c/pubspec.yaml": "name: c", "packages/c/lib/c.dart": "x",
+    "apps/app/pubspec.yaml": "name: app", "apps/app/lib/main.dart": "x",
+  });
+  await captureStdout(() => init({ cwd: melos, flags: {} }));
+  const melosMod = writable(melos, "integrator", "may_modify");
+  assert("layout: melos packages compress to packages/*/lib/**", melosMod.includes("packages/*/lib/**"), melosMod);
+  assert("layout: melos app module gets its own lib/**", melosMod.includes("apps/app/lib/**"), melosMod);
+  assert("layout: module tests go to the tester", writable(melos, "tester", "may_modify").includes("packages/a/test/**"),
+    writable(melos, "tester", "may_modify"));
+
+  // 4. Maven modules with no root pom: per-module src/main, and a stray script stays local.
+  const maven = fixture("layout-maven", {
+    "svc/a/pom.xml": "<project/>", "svc/a/src/main/java/A.java": "class A {}", "svc/a/scripts/run.sh": "echo",
+    "svc/b/pom.xml": "<project/>", "svc/b/src/main/java/B.java": "class B {}",
+    "svc/c/pom.xml": "<project/>", "svc/c/src/main/java/C.java": "class C {}", "svc/c/src/test/java/CT.java": "class CT {}",
+  });
+  await captureStdout(() => init({ cwd: maven, flags: {} }));
+  const mavenMod = writable(maven, "integrator", "may_modify");
+  assert("layout: maven modules compress to svc/*/src/main/**", mavenMod.includes("svc/*/src/main/**"), mavenMod);
+  assert("layout: a stray script opens only its module folder", mavenMod.includes("svc/a/scripts/**") && !mavenMod.includes("svc/**"), mavenMod);
+
+  // 5. Stack-less scripts repo: the root files are the source.
+  const scripts = fixture("layout-scripts", { "export.py": "x", "import.py": "x", "migrate.py": "x" });
+  await captureStdout(() => init({ cwd: scripts, flags: {} }));
+  assert("layout: root-level scripts become *.py", writable(scripts, "integrator", "may_modify").includes("*.py"),
+    writable(scripts, "integrator", "may_modify"));
+
+  // 6. The guard honours a layout glob.
+  fs.mkdirSync(path.join(nextSrc, ".agent/session"), { recursive: true });
+  fs.writeFileSync(path.join(nextSrc, ".agent/session/active-role.txt"), "integrator\n");
+  const inScope = runScriptWithInput(path.join(nextSrc, ".agent/checks/scope-check.sh"), [],
+    JSON.stringify({ tool_input: { file_path: path.join(nextSrc, "src/app/page.tsx") } }));
+  assert("layout: scope-check allows integrator on src/app/page.tsx", inScope === 0, inScope);
+
+  // 7. Re-running init keeps existing role files (refreshing them is update's job).
+  const roleFile = path.join(nextSrc, ".agent/roles/integrator.yaml");
+  fs.appendFileSync(roleFile, "# hand-tuned\n");
+  const tuned = fs.readFileSync(roleFile, "utf8");
+  await captureStdout(() => init({ cwd: nextSrc, flags: {} }));
+  assert("init: re-run keeps an existing role file", fs.readFileSync(roleFile, "utf8") === tuned, null);
+
+  // 8. --force on an existing contract needs a human (no TTY, no CI consent → refused).
+  const savedConsent = process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT;
+  delete process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT;
+  let forced;
+  try {
+    await captureAll(async () => { forced = await init({ cwd: nextSrc, flags: { force: true } }); });
+  } finally {
+    process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = savedConsent;
+  }
+  assert("init: --force on an existing contract is refused without a terminal", forced === 1, forced);
+  assert("init: refused --force leaves the role file alone", fs.readFileSync(roleFile, "utf8") === tuned, null);
+
+  // 9. Hooks wired in settings.local.json satisfy pre-generate.sh.
+  const spec = path.join(nextSrc, "spec.json");
+  fs.writeFileSync(spec, JSON.stringify({ feature_name: "f", input_shape: "i", output_shape: "o", error_cases: ["e"] }));
+  const settings = path.join(nextSrc, ".claude/settings.json");
+  const local = path.join(nextSrc, ".claude/settings.local.json");
+  const wired = fs.readFileSync(settings, "utf8");
+  fs.writeFileSync(settings, JSON.stringify({ enabledPlugins: {} }));
+  fs.writeFileSync(local, wired);
+  const viaLocal = runScript(path.join(nextSrc, ".agent/checks/pre-generate.sh"), [spec, "generator"]);
+  assert("pre-generate: hooks in settings.local.json count as wired", viaLocal === 0, viaLocal);
+  fs.writeFileSync(local, JSON.stringify({}));
+  const unwired = runScript(path.join(nextSrc, ".agent/checks/pre-generate.sh"), [spec, "generator"]);
+  assert("pre-generate: hooks in neither file is still a HARD FAIL", unwired === 1, unwired);
+
+  // 10. Hooks already wired in settings.local.json are not added to the shared file again.
+  const { installClaudeHooks } = require("../lib/util/hooks");
+  fs.writeFileSync(local, wired);
+  const shared = JSON.stringify({ enabledPlugins: {} });
+  fs.writeFileSync(settings, shared);
+  const res = installClaudeHooks(nextSrc, false);
+  assert("hooks: wiring in settings.local.json counts as installed", res.action === "skip", res);
+  assert("hooks: the shared settings.json is left untouched", fs.readFileSync(settings, "utf8") === shared, null);
+}
+
 (async () => {
   process.stdout.write("agent-contract smoke test\n");
   try {
@@ -2077,6 +2207,7 @@ async function suiteVersion() {
     await suiteEffort();
     await suiteConfigRefresh();
     await suiteVersion();
+    await suiteLayout();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);

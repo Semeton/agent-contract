@@ -134,6 +134,28 @@ write, so inference can only pick a role that would have allowed the write anywa
 contract-controlled paths are rejected before inference runs. The stderr note
 (`scope-check: role inferred=integrator path=lib/a.js basis=may_modify`) keeps it visible.
 
+**Layout-aware scopes.** Role globs start from the framework's canonical layout (`app/**` for
+Next.js, `lib/**` for Flutter, `src/main/**` for Maven). When those globs cover less than half
+of the repo's tracked source files, `detect` looks at where the files really are and adds:
+
+| Layout | Added globs |
+|---|---|
+| Next.js with a `src/` directory | `src/**`, plus root config files by name |
+| Monorepo modules (`pubspec.yaml`, `pom.xml`, `build.gradle`, `package.json`) | each module's `lib/`, `src/`, `src/main/` and test folders, compressed to `packages/*/lib/**` when three or more siblings match |
+| Files inside a module but outside its source folder | that module's sub-folder only (`svc/a/scripts/**`), never the whole parent |
+| Other uncovered folders | their top-level folder (`app/**`, `components/**` for Expo) |
+| Stack-less repos whose source is root files | `*.py`, `*.html`, … |
+
+Canonical globs are never removed, and a repo whose layout already fits gets exactly the
+defaults. On an existing contract any addition is a widening, so `update` asks for
+`--allow-scope-change` as usual. `init` no longer rewrites existing role files at all:
+refreshing roles is `update`'s job, behind that check, and `init --force` on an existing
+contract needs a human terminal.
+
+**Hooks in `settings.local.json`.** Claude Code merges `.claude/settings.local.json` over
+`settings.json`. Hooks wired in the local file count as installed (`init`/`update` won't add
+them to the shared file again), and `pre-generate.sh` accepts wiring in either file.
+
 **Writes outside the repo.** A repo-level contract does not police the whole filesystem, and
 `scope-check.sh` still allows writes to tmp dirs, scratch space and sibling projects. Two
 exceptions are enforced at any path, because they decide whether the contract runs at all:
