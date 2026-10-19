@@ -2137,6 +2137,16 @@ async function suiteCheck() {
   assert("check: unresolvable base is a usage error", (await gate({ base: "no-such-ref" })) === 2, null);
   assert("check: Decision heading parser ignores other headings",
     !bodyHasDecision("## Decisionless\ntext") && bodyHasDecision("### Decision\nbecause"), null);
+
+  // The repo's own PR template keeps its instructions in a multi-line comment. Opened and
+  // left untouched it must FAIL the gate; it used to pass because only one-line comments
+  // were ignored.
+  const template = fs.readFileSync(path.join(__dirname, "../docs/pull_request_template.md"), "utf8");
+  assert("check: an untouched PR template does not count as a decision", !bodyHasDecision(template), null);
+  assert("check: the template with a reason written in passes",
+    bodyHasDecision(template.replace("## Testing", "Pinned y: z needs it.\n\n## Testing")), null);
+  assert("check: text after a comment on the same line still counts",
+    bodyHasDecision("## Decision\n<!-- note --> Pinned y because z.\n"), null);
 }
 
 async function suiteLayout() {
