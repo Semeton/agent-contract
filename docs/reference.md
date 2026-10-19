@@ -125,7 +125,8 @@ the start of any session not dispatched through `agent-contract run`. With no ac
 
 Existence is what disambiguates: editing a file is a modification, creating one is a creation,
 and the two keys rarely overlap. A role declaring `inputs_required` is never inferred, so
-generating new source still requires the spec gate.
+generating new source still requires the spec gate — and `debugger`, which may modify source
+and tests, is only ever declared with a filled-in diagnosis rather than inferred.
 
 This relaxes ceremony, not enforcement. The chosen role's globs are still checked on every
 write, so inference can only pick a role that would have allowed the write anyway — an inferred
@@ -508,7 +509,7 @@ Enforcement runs at four layers:
 |---|---|---|
 | **PreToolUse — file tools** | Before each `Write`/`Edit`/`MultiEdit` | `scope-check.sh` is **fail-closed**: no role declared → all source writes blocked; declared role with no `roles/<role>.yaml` → blocked; a role whose `may_create`/`may_modify` are empty is **read-only** (e.g. `reviewer`, `security`) and may not write source. Otherwise it matches the target against the role's globs and blocks anything outside. |
 | **PreToolUse — Bash** | Before each `Bash` command | `bash-write-guard.sh` closes the hole that file-tool checks can't see: a Bash command (`echo > …`, `sed -i`, `tee`, `rm`, `cp`/`mv`) that writes to a **contract-controlled** file. High-precision and conservative — it only blocks writes *adjacent* to a protected path, so reads like `cat .agent/roles/x` are untouched. General source writes via Bash are left to the outcome layer. |
-| **post-generate — outcome check** | After `agent-contract run`, or as a pre-commit / CI gate | `post-generate.sh` re-runs the role scope check against `git diff` (authoritative: independent of write method), enforces `max_lines_per_file` and `new_packages` policy, applies persona gates, then runs lint, typecheck, tests, and the coverage gate. Empty-scope roles are fail-closed here too. |
+| **post-generate — outcome check** | After `agent-contract run`, or as a pre-commit / CI gate | `post-generate.sh` re-runs the role scope check against the working tree compared to `HEAD` — staged, unstaged and untracked files alike (authoritative: independent of write method; commit or stash unrelated work first), enforces `max_lines_per_file` and `new_packages` policy, applies persona gates, then runs lint, typecheck, tests, and the coverage gate. Empty-scope roles are fail-closed here too. |
 | **CI / git hook** | On commit / push | `debug-scope.sh` and `security-audit.sh` are **not** called by `agent-contract run` — wire them (and `post-generate.sh`) as a pre-commit hook or CI step. Hard gate before code lands. |
 
 #### Contract-controlled files (the guards protect themselves)
@@ -579,6 +580,10 @@ The debugger role enforces "fix, don't refactor" structurally:
 
 ```yaml
 role: debugger
+scope:
+  may_create: [<test globs>]            # a regression test
+  may_modify: [<source globs>, <test globs>]
+inputs_required: [symptom, diagnosis, affected_files, selected_solution]
 workflow:
   - reproduce
   - diagnose

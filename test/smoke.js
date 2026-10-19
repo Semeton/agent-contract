@@ -389,6 +389,10 @@ async function suiteChecks() {
   fs.writeFileSync(incompleteSpec, JSON.stringify({ feature_name: "x" }));
   let exitCode = runScript(path.join(target, ".agent/checks/pre-generate.sh"), [incompleteSpec]);
   assert("pre-generate hard-fails on missing fields", exitCode === 1, exitCode);
+  // A failing spec must not arm a role: persisting it first let scope-check permit the
+  // role's writes even though the spec gate had refused.
+  const declaredRole = path.join(target, ".agent/session/active-role.txt");
+  assert("pre-generate: failing spec persists no role", !fs.existsSync(declaredRole), null);
 
   // pre-generate: should pass with all fields
   const completeSpec = path.join(target, "spec-good.json");
@@ -403,6 +407,11 @@ async function suiteChecks() {
   );
   exitCode = runScript(path.join(target, ".agent/checks/pre-generate.sh"), [completeSpec]);
   assert("pre-generate passes with all fields", exitCode === 0, exitCode);
+  assert("pre-generate: passing spec persists the role",
+    fs.readFileSync(declaredRole, "utf8").trim() === "generator", null);
+  exitCode = runScript(path.join(target, ".agent/checks/pre-generate.sh"), [incompleteSpec, "tester"]);
+  assert("pre-generate: failing spec leaves the declared role as it was",
+    exitCode === 1 && fs.readFileSync(declaredRole, "utf8").trim() === "generator", exitCode);
 
   // post-generate.sh should contain stack-specific commands for a TypeScript + eslint + jest project
   const tsTarget = fixture("check-ts-target", {
@@ -1158,6 +1167,36 @@ async function suiteRoleInference() {
       writableGlobs(parseRoleScope(roleOf(ro))).length === 0, ro);
   }
 
+  // The debugger fixes what it diagnosed, so it may write source and tests — but only once
+  // declared. It requires a spec, so inference never picks it; otherwise it would tie with
+  // integrator and tester and make every ordinary edit ambiguous (the probes above pin that).
+  assert("debugger: declares writable globs",
+    writableGlobs(parseRoleScope(roleOf("debugger"))).length > 0, roleOf("debugger"));
+  assert("debugger: declares inputs_required", /^inputs_required:/m.test(roleOf("debugger")), null);
+  const edit = (rel) => runScriptWithInput(sc, [], JSON.stringify({
+    tool_name: "Edit", tool_input: { file_path: path.join(target, rel) },
+  }));
+  fs.writeFileSync(session, "debugger\n");
+  assert("debugger: declared debugger can fix existing source", edit("lib/a.js") === 0, null);
+  assert("debugger: declared debugger can fix an existing test", edit("test/a.test.js") === 0, null);
+  assert("debugger: declared debugger still cannot write outside source/tests",
+    edit("package.json") === BLOCK, null);
+
+  // pre-generate validates the debugger's own fields, not the generator defaults.
+  const preGen = path.join(target, ".agent/checks/pre-generate.sh");
+  const dSpec = path.join(target, "debug-spec.json");
+  fs.rmSync(session);
+  fs.writeFileSync(dSpec, JSON.stringify({ feature_name: "x", input_shape: "y", output_shape: "z", error_cases: [] }));
+  assert("debugger: a generator-shaped spec does not declare the debugger",
+    runScript(preGen, [dSpec, "debugger"]) === 1 && !fs.existsSync(session), null);
+  fs.writeFileSync(dSpec, JSON.stringify({
+    symptom: "s", diagnosis: "d", affected_files: ["lib/a.js"], selected_solution: "1",
+  }));
+  assert("debugger: a filled-in diagnosis declares it",
+    runScript(preGen, [dSpec, "debugger"]) === 0 && fs.readFileSync(session, "utf8").trim() === "debugger", null);
+  fs.rmSync(session);
+  fs.rmSync(dSpec);
+
   // -- status reports role drift in BOTH directions --------------------------
   // An earlier version only flagged scopes wider than the template, so a contract
   // that was simply never updated read as clean.
@@ -1608,6 +1647,48 @@ async function suiteScopeHardening() {
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "reviewer\n");
   const reviewerCode = runScriptWithInput(scopeCheck, [], writeInput("src/whatever.ts"));
   assert("scope-check: empty-scope role (reviewer) is fail-closed on source write", reviewerCode === BLOCK, reviewerCode);
+
+  // --- Path canonicalisation: the target is checked as requested AND as resolved ---
+  // Matched as a raw string, 'lib/../.agent/roles/x' passed as lib/**, and a symlinked
+  // directory reached a protected file with no '..' at all. rawInput skips path.join,
+  // which would normalise the '..' away before the hook ever saw it.
+  const rawInput = (p) =>
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: p, content: "x" } });
+  const asRole = (role) => fs.writeFileSync(path.join(sessionDir, "active-role.txt"), role + "\n");
+  asRole("generator");
+  assert("scope-check: BLOCKS '..' traversal into a protected file",
+    runScriptWithInput(scopeCheck, [], rawInput(`${target}/lib/../.agent/roles/tester.yaml`)) === BLOCK, null);
+  asRole("tester");
+  assert("scope-check: BLOCKS '..' traversal out of the role's scope",
+    runScriptWithInput(scopeCheck, [], rawInput(`${target}/test/../lib/a.js`)) === BLOCK, null);
+  assert("scope-check: '..' that stays inside the scope is still allowed",
+    runScriptWithInput(scopeCheck, [], rawInput(`${target}/test/unit/../a.test.js`)) === 0, null);
+
+  fs.mkdirSync(path.join(target, "test"), { recursive: true });
+  fs.mkdirSync(path.join(target, "lib"), { recursive: true });
+  fs.symlinkSync("../.agent/roles", path.join(target, "test/roles-link"));
+  fs.symlinkSync("../lib", path.join(target, "test/lib-link"));
+  fs.symlinkSync("../.agent/roles/tester.yaml", path.join(target, "test/role.yaml"));
+  assert("scope-check: BLOCKS a protected file reached through a symlinked dir",
+    runScriptWithInput(scopeCheck, [], writeInput("test/roles-link/tester.yaml")) === BLOCK, null);
+  assert("scope-check: BLOCKS a protected file reached through a file symlink",
+    runScriptWithInput(scopeCheck, [], writeInput("test/role.yaml")) === BLOCK, null);
+  // The kernel resolves 'link/..' to the parent of the link's TARGET: lexically this is
+  // test/checks/scope-check.sh (in tester scope), on disk it is .agent/checks/scope-check.sh.
+  assert("scope-check: BLOCKS 'link/..' resolved the way the kernel does",
+    runScriptWithInput(scopeCheck, [], rawInput(`${target}/test/roles-link/../checks/scope-check.sh`)) === BLOCK, null);
+  assert("scope-check: BLOCKS an out-of-scope file reached through a symlinked dir",
+    runScriptWithInput(scopeCheck, [], writeInput("test/lib-link/a.js")) === BLOCK, null);
+
+  // The project root in its resolved spelling (macOS: /var -> /private/var) used to leave
+  // the path absolute, which read as outside the repo and skipped the scope check. On a
+  // filesystem without such a link the two spellings coincide and this is a plain check.
+  const realTarget = fs.realpathSync(target);
+  assert("scope-check: resolved-root spelling is still scope-checked",
+    runScriptWithInput(scopeCheck, [], rawInput(path.join(realTarget, "lib/a.js"))) === BLOCK, null);
+  assert("scope-check: resolved-root spelling still allows in-scope writes",
+    runScriptWithInput(scopeCheck, [], rawInput(path.join(realTarget, "test/a.test.js"))) === 0, null);
+
   // restore a writing role for later
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "generator\n");
 
@@ -1648,19 +1729,62 @@ async function suiteScopeHardening() {
   const gitSession = path.join(gitTarget, ".agent/session");
   fs.mkdirSync(gitSession, { recursive: true });
   const postGen = path.join(gitTarget, ".agent/checks/post-generate.sh");
+  // Exit code AND stderr: a crash exits 1 too, and the read-only case used to pass
+  // this suite by crashing on an unbound array rather than by detecting anything.
+  const runPostGen = () => {
+    try {
+      execSync(`bash ${postGen}`, { stdio: "pipe" });
+      return { code: 0, err: "" };
+    } catch (e) {
+      return { code: e.status || 1, err: String(e.stderr || "") };
+    }
+  };
+  const asGitRole = (role) => fs.writeFileSync(path.join(gitSession, "active-role.txt"), role + "\n");
 
-  // reviewer (read-only) changes a source file → HARD FAIL
+  // The check compares the working tree to HEAD, so the contract itself is committed
+  // first — uncommitted init output would otherwise count as the task's change.
+  execSync("git add -A && git commit -m contract --allow-empty-message", { cwd: gitTarget, stdio: "pipe" });
+
+  // It used to read only `git diff --cached`: an agent's new file, never staged, was invisible.
   fs.mkdirSync(path.join(gitTarget, "src"), { recursive: true });
   fs.writeFileSync(path.join(gitTarget, "src/leak.ts"), "export const x = 1;\n");
-  execSync("git add src/leak.ts", { cwd: gitTarget, stdio: "pipe" });
-  fs.writeFileSync(path.join(gitSession, "active-role.txt"), "reviewer\n");
-  const reviewerOutcome = runScript(postGen, []);
-  assert("post-generate: read-only role (reviewer) source change is HARD FAIL", reviewerOutcome === 1, reviewerOutcome);
+  asGitRole("reviewer");
+  let pg = runPostGen();
+  assert("post-generate: read-only role's UNTRACKED source file is HARD FAIL",
+    pg.code === 1 && pg.err.includes("is read-only (no writable paths) but changed: src/leak.ts"), pg);
+  assert("post-generate: a failure says what the change set is compared against",
+    pg.err.includes("Compared against HEAD"), pg.err);
 
-  // generator changing the same source file is in scope → passes scope (and the lean stack has no other gates)
-  fs.writeFileSync(path.join(gitSession, "active-role.txt"), "generator\n");
-  const generatorOutcome = runScript(postGen, []);
-  assert("post-generate: generator source change passes scope check", generatorOutcome === 0, generatorOutcome);
+  // generator creating the same file is in scope → passes (the lean stack has no other gates)
+  asGitRole("generator");
+  pg = runPostGen();
+  assert("post-generate: generator source change passes scope check", pg.code === 0, pg);
+
+  // An unstaged edit to a tracked file is the task's change too.
+  execSync("git add src/leak.ts && git commit -m leak --allow-empty-message", { cwd: gitTarget, stdio: "pipe" });
+  fs.appendFileSync(path.join(gitTarget, "src/leak.ts"), "export const y = 2;\n");
+  asGitRole("tester");
+  pg = runPostGen();
+  assert("post-generate: UNSTAGED edit outside the role's scope is HARD FAIL",
+    pg.code === 1 && pg.err.includes("scope violation: src/leak.ts"), pg);
+
+  // ...and staging it does not change the answer.
+  execSync("git add src/leak.ts", { cwd: gitTarget, stdio: "pipe" });
+  pg = runPostGen();
+  assert("post-generate: STAGED edit outside the role's scope is HARD FAIL",
+    pg.code === 1 && pg.err.includes("scope violation: src/leak.ts"), pg);
+  execSync("git reset -q && git checkout -- src/leak.ts", { cwd: gitTarget, stdio: "pipe" });
+
+  // debug-scope reads the same change set; the report it is given is not part of the fix.
+  const debugScope = path.join(gitTarget, ".agent/checks/debug-scope.sh");
+  fs.writeFileSync(path.join(gitTarget, "debug-report.md"),
+    "# Debug Report\n\n## Affected Files\n- src/leak.ts:1-2\n\n## Proposed Solutions\n");
+  fs.appendFileSync(path.join(gitTarget, "src/leak.ts"), "// fix\n");
+  assert("debug-scope: unstaged fix inside the diagnosis passes (report itself ignored)",
+    runScript(debugScope, [path.join(gitTarget, "debug-report.md")]) === 0, null);
+  fs.writeFileSync(path.join(gitTarget, "src/extra.ts"), "export {};\n");
+  assert("debug-scope: UNTRACKED file outside the diagnosis is HARD FAIL",
+    runScript(debugScope, [path.join(gitTarget, "debug-report.md")]) === 1, null);
 }
 
 async function suiteEffort() {
