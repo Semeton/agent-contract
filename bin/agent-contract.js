@@ -9,6 +9,7 @@ const { detect } = require("../lib/commands/detect");
 const { run } = require("../lib/commands/run");
 const { update } = require("../lib/commands/update");
 const { status } = require("../lib/commands/status");
+const { check } = require("../lib/commands/check");
 
 const PKG = require("../package.json");
 
@@ -18,6 +19,7 @@ const COMMANDS = {
   run,
   update,
   status,
+  check,
 };
 
 function printHelp() {
@@ -34,6 +36,7 @@ function printHelp() {
       "  detect    Run stack detection only; print result to stdout (no writes)",
       "  run       Run a role against a task via the configured provider",
       "  status    Show active role, last decisions, map freshness, and registered checks",
+      "  check     Merge gate for a PR: fail when sensitive paths changed without a recorded decision",
       "",
       "Flags (all commands):",
       "  --cwd <path>     Run against the given directory (default: process.cwd())",
@@ -61,6 +64,13 @@ function printHelp() {
       "  --allow-scope-change   Consent to roles gaining writable paths. Without it, update prints",
       "                         the widened globs and refuses. Blocked inside an agent session —",
       "                         run it from your own terminal.",
+      "",
+      "Flags (check):",
+      "  --base <ref>       Compare base...HEAD (default: origin/$GITHUB_BASE_REF, else origin/HEAD)",
+      "  --pr-body <file>   PR description to search for a '## Decision' section",
+      "                     (default: pull_request.body from $GITHUB_EVENT_PATH in GitHub Actions)",
+      "  Configure in .agent/config.yaml: decisions_required_for: <glob>, <glob>, …",
+      "                                   decisions_dir: docs/decisions",
       "",
       "Flags (run):",
       "  --role <name>    Role to activate: generator | integrator | tester | debugger | documenter",
@@ -239,6 +249,8 @@ function parseFlags(args) {
     else if (a === "--allow-scope-change") flags.allowScopeChange = true;
     else if (a === "--preset") flags.preset = args[++i];
     else if (a === "--persona") flags.persona = args[++i];
+    else if (a === "--base") flags.base = args[++i];
+    else if (a === "--pr-body") flags.prBody = args[++i];
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
     else flags._.push(a);
   }

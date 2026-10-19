@@ -1,68 +1,125 @@
 # agent-contract
 
-> A deterministic contract layer between humans and coding agents.
+> Guardrails and a merge gate for coding agents.
 
-`CLAUDE.md`, `AGENTS.md`, `.cursorrules` — today's "agent guidance" is prose that *asks* models to behave. They skim it, it drifts from the code, and nothing stops an agent from editing what it shouldn't.
+Agents write code fast. Two things still need a human-grade answer: **what was the agent allowed to touch**, and **why did a risky change happen**. agent-contract answers both with deterministic checks — shell scripts and a CLI that exit non-zero — instead of prose that asks the model to behave.
 
-**agent-contract replaces the asking with enforcement.** One command drops a `.agent/` contract into any repo. Each task gets a scope, and every out-of-scope write is blocked by a shell check that exits non-zero — *before* it touches your code. Any agent, any model.
+It works at two points:
+
+- **At merge time, for any agent.** `agent-contract check` runs in CI on the pull request's diff. A change that touches a sensitive path — a dependency manifest, CI workflows, the contract's own scopes — must carry a recorded decision, or the check fails. It reads the diff, not the agent, so it works the same for Claude Code, Codex, Copilot, Cursor or a human.
+- **During a Claude Code session.** `PreToolUse` hooks scope every file write to a role and refuse writes to the contract itself. Other agents get the same rules as written guidance (`AGENTS.md`, `.cursorrules`, Copilot instructions) — read, not enforced.
+
+## What it looks like
+
+Real output from a NestJS repo after `agent-contract init`, with no role declared:
 
 ```
-# after init, you just write the prompt — the contract does the rest
-❯ fix the null check in payroll invoicing
+$ edit src/payroll/new-report.ts      # new source needs a spec
+scope-check: BLOCKED reason=spec-required roles=generator fix="pre-generate.sh <spec> <role>"
 
-contract ▸ active · role: integrator (inferred) · scope: src/payroll/**
+$ edit src/payroll/invoice.ts         # existing source: role inferred
+scope-check: role inferred=integrator path=src/payroll/invoice.ts basis=may_modify
 
-agent ▸ Edit  src/payroll/invoice.ts          ✓ allowed
-agent ▸ Edit  src/payroll/invoice.test.ts     ✓ allowed
-agent ▸ Edit  src/auth/session.ts             ✗ BLOCKED
-  scope-check: src/auth/session.ts is outside role 'integrator'
-  scope (src/payroll/**).  exit 2
+$ edit test/invoice.spec.ts           # integrator does not own tests
+scope-check: BLOCKED reason=out-of-scope role=integrator path=test/invoice.spec.ts allowed=src/**
 
-✓ 1 fix shipped. 0 files touched outside scope.
+$ edit package.json                   # no role owns the dependency manifest
+scope-check: BLOCKED reason=out-of-scope role=integrator path=package.json allowed=src/**
+
+$ edit src/../.agent/roles/integrator.yaml
+scope-check: BLOCKED reason=contract-controlled path=.agent/roles/integrator.yaml fix=out-of-band
 ```
 
-The premise: you can't make a non-deterministic agent deterministic. You *can* make the **system around it** deterministic, so non-determinism is contained to small, verifiable units.
+And in CI, on a branch that adds a dependency without saying why:
+
+```
+$ agent-contract check --base origin/main
+agent-contract check  origin/main...HEAD  (2 files changed)
+  sensitive paths changed:
+    package.json
+  decisions: MISSING — these changes need a recorded reason. Either:
+    • commit docs/decisions/NNNN-<title>.md with the change, or
+    • add a '## Decision' section to the PR description.
+```
+
+Role scopes are per *area* (source, tests, docs), derived from your framework's layout — not per task. A role that may edit `src/**` may edit all of it.
 
 ## Install
 
 ```bash
-npm i -g @semeton/agent-contract   # CLI on your PATH; updates are one `npm i -g` away
-agent-contract init                # detect stack, write contract, install hooks
+npm i -g @semeton/agent-contract
+agent-contract init        # detect stack, write .agent/, install Claude Code hooks
+git add -A && git commit -m "add agent contract"
 ```
 
-Prefer no global install? `npx @semeton/agent-contract init` does it in one shot. `init` is idempotent — re-run any time; your conventions and shims are never clobbered. **Zero runtime dependencies**, pure Node stdlib.
+Commit the contract before handing work to an agent: the outcome checks compare the working tree to `HEAD`, so uncommitted `init` output would count as the agent's change. `init` is idempotent and never rewrites existing roles or your conventions. **Zero runtime dependencies.**
 
-## How it works
+## The merge gate
 
-Five gates sit between a prompt and your codebase. Four of them are shell scripts that exit non-zero on a violation — the orchestrator reads exit codes, not promises.
+Add one step to CI:
 
-| # | Gate | What it does |
-|---|---|---|
-| 1 | **Orient** | An always-on shim states the enforced rules and points at the contract — `manifest.yaml`, codebase map, conventions, prior handoffs. No mandated reading order; the agent reads what the task needs. |
-| 2 | **Declare scope** | `pre-generate.sh` validates the task has what it needs, then records the active role — which arms the enforcement hook. |
-| 3 | **Enforce live** | A `PreToolUse` hook checks every Write/Edit against the role's allowed paths. Out-of-scope writes are blocked before they land. |
-| 4 | **Verify** | `post-generate.sh` runs the right linter, type-checker and tests for your stack, plus your `conventions.yaml` gates. |
-| 5 | **Hand off** | A `Stop` hook writes a handoff note on any turn with changes, so the next session boots with context instead of starting over. |
+```yaml
+# .github/workflows/agent-contract.yml
+on: pull_request
+jobs:
+  decisions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: npx -y @semeton/agent-contract check
+```
 
-**Fail-closed by design.** No role declared → all source writes blocked. The agent can't widen its own scope either: `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt` and `.claude/settings*` are off-limits in-session and changed only out-of-band. See the [enforcement model](docs/reference.md#enforcement-model) for the full four-layer breakdown.
+In GitHub Actions it compares `origin/$GITHUB_BASE_REF...HEAD` and reads the PR description from the event payload. Elsewhere pass `--base <ref>` and `--pr-body <file>`.
+
+A decision counts when the change **adds or edits** `docs/decisions/*.md`, or the PR description has a `## Decision` section with text under it. Deleting a decision file records nothing.
+
+Sensitive by default: dependency manifests (`package.json`, `composer.json`, `requirements*.txt`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`, `pom.xml`, `build.gradle`, `pubspec.yaml`, `*.csproj`), `.agent/roles/**`, `.agent/checks/**`, `.agent/conventions.yaml`, `.github/workflows/**` and `.claude/settings.json`. Replace the list in `.agent/config.yaml`:
+
+```yaml
+decisions_required_for: package.json, db/migrations/**, src/billing/**
+decisions_dir: docs/decisions
+```
+
+Decisions live where your team already reviews them — in git, next to the change — rather than in a log the agent may or may not write.
+
+## In-session enforcement (Claude Code)
+
+| Gate | What it does |
+|---|---|
+| **Scope** | A `PreToolUse` hook checks every Write/Edit against the active role's globs. With no role declared it infers one when exactly one role covers the file, and blocks otherwise. Paths are checked as written and as resolved on disk, so `..` and symlinks don't get around it. |
+| **Spec** | Creating new source means declaring `generator` through `pre-generate.sh <spec.json>`, which requires `feature_name`, `input_shape`, `output_shape`, `error_cases`. The debugger is declared the same way with its diagnosis. |
+| **Contract files** | `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt` and `.claude/settings*` are refused in-session. A second hook catches common Bash writes to them. |
+| **Outcome** | `post-generate.sh` re-checks the working tree against the role, then runs your stack's linter, type-checker and tests. |
+
+**What this does not do.** The Bash guard matches command text, so `node -e`, `sed -i.bak` and similar get past it — it is a speed bump, not a sandbox. For OS-level enforcement turn on Claude Code's sandbox and add native deny rules; they cover every subprocess:
+
+```json
+{
+  "permissions": { "deny": ["Edit(/.agent/roles/**)", "Edit(/.agent/checks/**)", "Edit(/package.json)"] },
+  "sandbox": { "enabled": true, "allowUnsandboxedCommands": false }
+}
+```
+
+The agent also chooses its own role by running `pre-generate.sh`, and writes its own spec. Roles narrow what a session touches by area; they don't stop a determined agent from switching. The merge gate is the check that does not depend on the agent at all.
 
 ## What you get
 
 ```
 your-repo/
 ├── .agent/
-│   ├── manifest.yaml        ← single entrypoint (persona, stack refs, policy)
+│   ├── manifest.yaml        ← single entrypoint
 │   ├── stack.yaml           ← auto-detected: language, framework, ORM, DB, test runner
-│   ├── conventions.yaml     ← your engineering rules (the only file you hand-tune)
+│   ├── conventions.yaml     ← your engineering rules
+│   ├── config.yaml          ← provider, effort, decision-gate paths
 │   ├── roles/*.yaml         ← per-role scope (generator, integrator, tester, reviewer,
-│   │                          debugger, documenter, security) — regenerated from stack
-│   ├── checks/*.sh          ← the hard gates (pre/post-generate, scope, debug, security)
+│   │                          debugger, documenter, security)
+│   ├── checks/*.sh          ← pre/post-generate, scope, debug-scope, security, review
 │   ├── templates/*.md       ← commit, PR, debug-report, handoff
-│   ├── memory/              ← codebase-map.md + decisions.jsonl + handoff notes
-│   └── session/             ← active-role.txt (read by the scope hook); git-ignored
-├── .claude/settings.json    ← Claude Code hooks (PreToolUse scope check + Stop handoff)
-├── CLAUDE.md  AGENTS.md  .cursorrules  .github/copilot-instructions.md
-                             ← shims pointing every major agent at the same manifest
+│   ├── memory/              ← codebase-map.md, handoff notes
+│   └── session/             ← active-role.txt; git-ignored
+├── .claude/settings.json    ← Claude Code hooks
+└── CLAUDE.md  AGENTS.md  .cursorrules  .github/copilot-instructions.md
 ```
 
 ## Supported stacks (auto-detection)
@@ -84,37 +141,15 @@ your-repo/
 | Dart / Flutter | Flutter | sqflite, drift, postgres |
 | Deno | Fresh, Oak, Hono | — |
 
+When a repo's layout drifts from its framework's defaults (a `src/` directory in Next.js, monorepo modules, stack-less repos), role scopes are widened to where the source actually is.
+
 ## Contributing
 
-**Adding a language is one file.** Each stack is a single detector in `lib/detect/detectors/` that returns evidence and a score — the highest score wins:
-
-```js
-// lib/detect/detectors/elixir.js
-module.exports = {
-  async detect(ctx) {
-    const mix = await ctx.read("mix.exs");
-    if (!mix) return null;
-    return {
-      language: "elixir",
-      framework: mix.includes(":phoenix") ? "phoenix" : "none",
-      orm: "ecto",
-      score: 90,
-    };
-  },
-};
-```
-
-Zero deps to learn, pure stdlib, no build step. One smoke test (`npm test`) gates every publish. Other good first issues: a read-back YAML parser, `--learn` auto-merge, and a true orchestrator feedback loop. PRs welcome.
+Adding a language is one file in `lib/detect/detectors/` that returns evidence and a score — the highest score wins. Zero deps, no build step; `npm test` gates every publish. PRs welcome.
 
 ## Learn more
 
-The [full reference](docs/reference.md) covers everything in depth:
-
-- [Commands](docs/reference.md#usage) — `init`, `update`, `detect`, `run` with every flag
-- [Enforcement model](docs/reference.md#enforcement-model) — the four layers, contract-controlled files, what's guaranteed vs. best-effort
-- [Session continuity](docs/reference.md#session-continuity) — the always-on shim, codebase map, handoff notes
-- [Personas & presets](docs/reference.md#personas) — `architect`/`vibecoder`/`lead`/`pragmatist` and convention starting points
-- [Token management](docs/reference.md#token-management), [conventions enforcement](docs/reference.md#conventions-enforcement), and the [programmatic API](docs/reference.md#programmatic-api)
+The [full reference](docs/reference.md) covers every command and flag, the enforcement model in depth, personas and presets, and the programmatic API.
 
 ## License
 

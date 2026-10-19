@@ -2061,6 +2061,76 @@ async function suiteVersion() {
 
 // Layout-aware scopes (lib/detect/layout.js), init's role handling, and hook wiring
 // through settings.local.json.
+// The merge gate: sensitive paths changed on a branch need a recorded decision — a
+// docs/decisions/*.md file in the change, or a '## Decision' section in the PR body.
+async function suiteCheck() {
+  process.stdout.write("\n[check]\n");
+  const { check, bodyHasDecision } = require("../lib/commands/check");
+
+  const repo = fixture("check-gate", { "package.json": JSON.stringify({ name: "g" }), "a.js": "1\n" });
+  const sh = (cmd) => execSync(cmd, { cwd: repo, stdio: "pipe" });
+  const commit = (msg) => sh(`git add -A && git -c user.email=t@t -c user.name=t commit -qm ${msg}`);
+  sh("git init -q -b main");
+  commit("init");
+  sh("git checkout -qb feat");
+  const gate = (flags = {}) => captureAll(() => check({ cwd: repo, flags: { base: "main", ...flags } }));
+
+  fs.appendFileSync(path.join(repo, "a.js"), "2\n");
+  commit("plain");
+  assert("check: ordinary change needs no decision", (await gate()) === 0, null);
+
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "g", dependencies: { y: "1" } }));
+  commit("dep");
+  assert("check: dependency change without a decision FAILS", (await gate()) === 1, null);
+
+  const body = path.join(repo, "..", "check-gate-body.md");
+  fs.writeFileSync(body, "## Decision\n\n<!-- why -->\n");
+  assert("check: an empty Decision section does not count", (await gate({ prBody: body })) === 1, null);
+  fs.writeFileSync(body, "## Summary\nx\n\n## Decision\nAdd y: needed for z.\n");
+  assert("check: a filled-in Decision section in the PR body passes", (await gate({ prBody: body })) === 0, null);
+
+  // GitHub Actions: the PR body comes from the event payload when --pr-body is absent.
+  const event = path.join(repo, "..", "check-gate-event.json");
+  fs.writeFileSync(event, JSON.stringify({ pull_request: { body: "## Decisions\nPinned y.\n" } }));
+  process.env.GITHUB_EVENT_PATH = event;
+  try {
+    assert("check: reads the PR body from GITHUB_EVENT_PATH", (await gate()) === 0, null);
+  } finally {
+    delete process.env.GITHUB_EVENT_PATH;
+  }
+
+  fs.mkdirSync(path.join(repo, "docs/decisions"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "docs/decisions/0001-add-y.md"), "# Add y\n");
+  commit("adr");
+  assert("check: a decision file committed with the change passes", (await gate()) === 0, null);
+
+  // Recording means adding or editing: deleting a decision file records nothing.
+  sh("git checkout -q main && git checkout -qb feat2");
+  commit("seed --allow-empty");
+  fs.mkdirSync(path.join(repo, "docs/decisions"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "docs/decisions/0002-old.md"), "# old\n");
+  commit("seed-adr");
+  sh("git checkout -q main");
+  sh("git merge -q --ff-only feat2");
+  sh("git checkout -qb feat3");
+  fs.rmSync(path.join(repo, "docs/decisions/0002-old.md"));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "g", dependencies: { z: "1" } }));
+  commit("delete-adr");
+  assert("check: deleting a decision file does not satisfy the gate", (await gate()) === 1, null);
+
+  // Configurable: decisions_required_for replaces the defaults.
+  fs.mkdirSync(path.join(repo, ".agent"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".agent/config.yaml"), "decisions_required_for: db/migrations/**, a.js\n");
+  assert("check: custom globs replace the defaults (package.json no longer sensitive)", (await gate()) === 0, null);
+  fs.appendFileSync(path.join(repo, "a.js"), "3\n");
+  commit("touch-a");
+  assert("check: custom glob triggers the gate", (await gate()) === 1, null);
+
+  assert("check: unresolvable base is a usage error", (await gate({ base: "no-such-ref" })) === 2, null);
+  assert("check: Decision heading parser ignores other headings",
+    !bodyHasDecision("## Decisionless\ntext") && bodyHasDecision("### Decision\nbecause"), null);
+}
+
 async function suiteLayout() {
   process.stdout.write("\n[layout]\n");
   const readRole = (dir, role) => fs.readFileSync(path.join(dir, ".agent/roles", `${role}.yaml`), "utf8");
@@ -2208,6 +2278,7 @@ async function suiteLayout() {
     await suiteConfigRefresh();
     await suiteVersion();
     await suiteLayout();
+    await suiteCheck();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);
