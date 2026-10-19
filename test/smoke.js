@@ -31,6 +31,14 @@ process.env.AGENT_CONTRACT_NONINTERACTIVE_CONSENT = "1";
 // preset/persona prompts — invisible, because tests capture stdout — and wait forever.
 // Pin both streams to non-interactive so `npm test` (and prepublishOnly) behave the same everywhere.
 for (const s of [process.stdin, process.stdout]) Object.defineProperty(s, "isTTY", { value: false, configurable: true });
+// Fixtures commit with plain `git commit`. A CI runner has no global git identity, so
+// those commits failed there while passing on any developer machine. Give every child
+// git process the same throwaway identity and default branch, independent of the host.
+Object.assign(process.env, {
+  GIT_AUTHOR_NAME: "agent-contract-test", GIT_AUTHOR_EMAIL: "test@agent-contract.invalid",
+  GIT_COMMITTER_NAME: "agent-contract-test", GIT_COMMITTER_EMAIL: "test@agent-contract.invalid",
+  GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "init.defaultBranch", GIT_CONFIG_VALUE_0: "main",
+});
 // PreToolUse blocks ONLY on exit 2. Every other non-zero code is a non-blocking hook
 // error and the tool call proceeds, so a guard exiting 1 refuses in words and permits
 // in fact. These assertions are what pins that down.
