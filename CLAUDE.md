@@ -186,10 +186,7 @@ Enforcement here is mechanical, not advisory: PreToolUse hooks read `.agent/` an
 non-zero to block a write. These rules hold whether or not the prompt mentions them.
 
 - **Declare a role before writing source.** Run `.agent/checks/pre-generate.sh <spec.json> <role>` —
-  it validates the spec and sets the active role. Roles: generator integrator tester reviewer debugger documenter security.
-  With no role declared, the guard infers one from the write target when exactly one role
-  can account for it, and blocks otherwise. Creating new source always needs the explicit
-  gate, because generator declares `inputs_required`.
+  it validates the spec and sets the active role. Roles: generator integrator tester reviewer debugger documenter security. No role declared → source writes are blocked.
 - **Stay in your role's scope.** `.agent/roles/<role>.yaml` lists the writable globs; an empty list means read-only.
 - **Contract files are off-limits in-session** — `.agent/roles/**`, `.agent/checks/**`,
   `.agent/session/active-role.txt`, `.claude/settings*`. Change those out-of-band: a human edit or `agent-contract update`.
