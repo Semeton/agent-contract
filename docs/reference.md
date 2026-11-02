@@ -11,16 +11,16 @@ One command drops a `.agent/` scaffold into your repo:
 - **Roles as scoped contracts** — generator, integrator, tester, reviewer, debugger, documenter, security. Each role's YAML declares what it may create, modify, delete. Scopes are generated from detected framework: a Laravel init gets `app/**, config/**, routes/**`; a Rails init gets `app/**, config/**, db/**`; a NestJS init gets `src/**`. No more hardcoded `src/**` for every stack. Roles are always regenerated from the detected stack on `init` and `update` — they are declarative output, not user-edited config.
 - **Checks as hard gates** — pre-/post-generate, debug-scope, and security-audit scripts that exit non-zero when an agent overreaches. Plug into git hooks and CI.
 - **Per-stack linting/testing in checks** — `post-generate.sh` calls the right linter, typechecker, and test runner for your stack automatically.
-- **Conventions enforcement** — `post-generate.sh` reads `max_lines_per_file` and `new_packages` policy directly from `conventions.yaml`. If a file exceeds the declared limit or `package.json` changes without a logged approval, the check hard-fails.
+- **Conventions enforcement** — `post-generate.sh` reads `max_lines_per_file` and `new_packages` policy directly from `conventions.yaml`. If a file exceeds the declared limit, the check hard-fails. A dependency-manifest change prints a notice; the binding gate for it is `agent-contract check` at merge.
 - **Claude Code hooks** — `init` writes `.claude/settings.json` with three hooks: a `PreToolUse` hook on the file tools that blocks out-of-scope writes _before_ they happen, a `PreToolUse` hook on `Bash` that stops commands from tampering with contract-controlled files (the self-escape vector), and a `Stop` hook that auto-writes a handoff note after every turn that produces git changes. No model cooperation required.
 - **Self-protecting & fail-closed** — the agent cannot rewrite its own role, widen a role's scope, or edit the guard scripts: `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt`, and `.claude/settings*` are off-limits in-session and changed only out-of-band. A role with an empty scope is read-only, not unrestricted. See [Enforcement model](#enforcement-model).
-- **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`. Persona now affects check behaviour, not just guidance text: `architect` hard-fails when >3 files change with no decision logged; `vibecoder` skips the coverage gate entirely.
+- **Personas** — set the agent's working tone at init time: `architect`, `vibecoder`, `lead`, or `pragmatist`. Persona now affects check behaviour, not just guidance text: `architect` prints a notice to record the design decision when >3 files change; `vibecoder` skips the coverage gate entirely.
 - **Convention presets** — start from `oop-strict`, `functional-pragmatic`, `nestjs-clean-architecture`, or `laravel-service-pattern`.
 - **Orchestrator** — `agent-contract run` dispatches a role against a task via Anthropic, OpenAI, the `claude` CLI (for Claude Pro/Max users), or a dry-run echo provider.
 - **Codebase memory map** — on every `init` and `update`, scans the repo and writes `.agent/memory/codebase-map.md`: a structured index of your directory tree (with filenames at depth ≤ 2), entry points, key config files, and top-level dependencies. Agents consult the map before reading source files — they can navigate directly to the right file without scanning. Crowded directories (>20 source files) are annotated with a count instead of an exhaustive list so the map stays bounded on large projects.
 - **Session handoff protocol** — the contract shim instructs agents to write a handoff note at task completion and load the most recent one at session start. Context is never silently lost across sessions.
 - **Token management** — tracks context window usage per run. Warns at 70%, writes a handoff note at 85% and on every successful task completion.
-- **Decisions recorded with the change** — `agent-contract check` fails a pull request that touches a sensitive path (dependency manifests, CI, the contract's own scopes) without a `docs/decisions/*.md` file or a `## Decision` section in its description. See [Check](#check). `memory/decisions.jsonl` remains for agents that choose to log, but nothing requires it.
+- **Decisions recorded with the change** — `agent-contract check` fails a pull request that touches a sensitive path (dependency manifests, CI, the contract's own scopes) without a `docs/decisions/*.md` file or a `## Decision` section in its description. See [Check](#check). With [repo-memory](https://github.com/Semeton/repo-memory) installed, a repo-memory record (in its configured folder) counts the same as an ADR.
 - **Self-updating** — `agent-contract update` checks npm for a newer version first. If one exists, it installs it globally and re-execs with the new templates automatically.
 - **Discoverable by every major agent** — drops shim files at `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, all pointing to the same manifest.
 
@@ -346,7 +346,7 @@ Every shim file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-inst
 - **Declare a role before writing source** — run `.agent/checks/pre-generate.sh <task-spec.json> <role>`. This validates the spec **and** writes `.agent/session/active-role.txt`, which enables the scope-enforcement hooks. `active-role.txt` is contract-controlled, so hand-editing it is blocked; running `pre-generate.sh` (or a dispatcher) is the sanctioned way to set the role. With no role declared the guard falls back to inference (below) and blocks when the answer is not unique.
 - **Stay inside the role's scope** — `.agent/roles/<role>.yaml` lists the writable globs; an empty list means read-only.
 - **Contract files are off-limits in-session** — `.agent/roles/**`, `.agent/checks/**`, `.agent/session/active-role.txt`, `.claude/settings*`.
-- **Fix only what was asked**, **ask when inputs are ambiguous**, and **log non-trivial decisions** to `.agent/memory/decisions.jsonl`.
+- **Fix only what was asked**, **ask when inputs are ambiguous**, and **record decisions in `docs/decisions/`**: as an ADR, or as a repo-memory proposal when `repo-memory.json` is present. The shim picks the wording when `init` or `update` runs.
 
 The shim then lists the context that exists — manifest, codebase map, conventions, prior handoffs — and states explicitly that there is **no required reading order**.
 
@@ -441,7 +441,7 @@ When the 85% threshold is crossed:
 ╚══════════════════════════════════════════════════════════╝
 ```
 
-The handoff note contains the current role, task, token stats, the last 5 entries from `decisions.jsonl`, and a ready-to-paste prompt for the new session.
+The handoff note contains the current role, task, token stats, the last 5 entries from the run log (`runs.jsonl`), and a ready-to-paste prompt for the new session.
 
 **Known context window limits:**
 
@@ -532,7 +532,7 @@ your-repo/
 │   │   ├── debug-report.md
 │   │   └── handoff.md            ← fill-in template agents complete at task end
 │   ├── memory/
-│   │   ├── decisions.jsonl                    ← append-only decision log
+│   │   ├── runs.jsonl                         ← one line per `agent-contract run` (telemetry, not decisions)
 │   │   ├── codebase-map.md                    ← auto-generated repo index (refreshed on update)
 │   │   ├── handoff-done-{timestamp}.md        ← written after every completed task
 │   │   └── handoff-archive.jsonl              ← compacted old handoffs (keeps 5 most recent)
@@ -618,7 +618,7 @@ npx jest --findRelatedTests <changed files>
 | Convention key | Enforcement |
 |---|---|
 | `module_size.max_lines_per_file` | Hard-fails if any changed file under `src/` exceeds the declared limit. Default 300 if key is absent. |
-| `dependencies.new_packages: requires_human_approval` | Hard-fails if `package.json` is in the diff and no `approv` entry exists in the last 10 lines of `decisions.jsonl`. |
+| `dependencies.new_packages: requires_human_approval` | Prints a notice when `package.json` or `composer.json` is in the diff. It no longer hard-fails: the old gate passed when the agent itself appended a line containing "approv" to a log. No default role may write `package.json`, so the scope guard blocks the edit in-session, and `agent-contract check` requires a recorded decision at merge. |
 | `testing.min_coverage` | Runs the test suite with coverage (`jest --coverage`, `pytest --cov`, `go test -cover`, `phpunit --coverage-text`, JaCoCo CSV) and hard-fails if statement coverage is below the declared threshold. Skipped for `vibecoder` persona. |
 
 ### Persona gates in checks
@@ -627,7 +627,7 @@ Personas now affect check behaviour in addition to guidance text:
 
 | Persona | Additional check gate |
 |---|---|
-| `architect` | Hard-fails when >3 files changed and the last line of `decisions.jsonl` has no `"task"` key — forces a logged decision before large changes land. |
+| `architect` | Prints a notice to record the design decision in `docs/decisions/` when >3 files changed. (The old hard fail was satisfied by every run-log line, so it never failed.) |
 | `vibecoder` | Coverage gate is skipped entirely. |
 | `lead` / `pragmatist` | No additional gates beyond the defaults. |
 

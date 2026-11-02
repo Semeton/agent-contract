@@ -546,16 +546,17 @@ async function suiteRun() {
   });
   await captureStdout(async () => init({ cwd: target, flags: {} }));
 
-  // echo provider should succeed and append a decisions entry
+  // echo provider should succeed and append a run-log entry
   const exitCode = await captureAll(() =>
     run({ cwd: target, flags: { role: "generator", task: "add hello endpoint", provider: "echo" } })
   );
   assert("run: echo provider exits 0", exitCode === 0, exitCode);
 
-  const decisionsRaw = fs.readFileSync(path.join(target, ".agent/memory/decisions.jsonl"), "utf8").trim();
-  const lastLine = decisionsRaw.split("\n").filter((l) => l.trim()).pop();
+  const runsRaw = fs.readFileSync(path.join(target, ".agent/memory/runs.jsonl"), "utf8").trim();
+  const lastLine = runsRaw.split("\n").filter((l) => l.trim()).pop();
   const entry = JSON.parse(lastLine);
-  assert("run: appends to decisions.jsonl", entry.role === "generator", entry);
+  assert("run: appends to runs.jsonl", entry.role === "generator", entry);
+  assert("run: no decisions.jsonl is created", !fs.existsSync(path.join(target, ".agent/memory/decisions.jsonl")), null);
 
   // Completion handoff should be written after every successful run
   const memDir = path.join(target, ".agent/memory");
@@ -619,7 +620,7 @@ async function suiteTokens() {
     provider: "anthropic",
     model: "claude-opus-4-7",
     usage: { total: 170000, limit: 200000, pct: 85 },
-    recentDecisions: [
+    recentRuns: [
       { ts: "2026-05-16T10:00:00.000Z", role: "generator", task: "scaffold user module", output_lines: 42 },
     ],
   });
@@ -628,9 +629,15 @@ async function suiteTokens() {
   assert("tokens: handoffNote contains task", note.includes("add auth middleware"), note.slice(0, 300));
   assert("tokens: handoffNote contains pct", note.includes("85%"), note.slice(0, 400));
   assert("tokens: handoffNote contains fresh session prompt", note.includes("fresh session"), note.slice(0, 600));
-  assert("tokens: handoffNote contains prior decision", note.includes("scaffold user module"), note);
+  assert("tokens: handoffNote contains prior run", note.includes("scaffold user module"), note);
+  assert("tokens: handoffNote points at runs.jsonl and docs/decisions", note.includes("runs.jsonl") && note.includes("docs/decisions/") && !note.includes("decisions.jsonl"), note);
+  const legacyNote = T.handoffNote({
+    role: "g", task: "t", provider: "p", model: "m", usage: { total: 1, limit: 10, pct: 10 },
+    recentDecisions: [{ ts: "x", role: "g", task: "legacy caller", output_lines: 1 }],
+  });
+  assert("tokens: handoffNote still accepts the pre-0.10 recentDecisions argument", legacyNote.includes("legacy caller"), legacyNote);
 
-  // decisions.jsonl entry includes tokens field after a run
+  // runs.jsonl entry includes tokens field after a run
   const target = fixture("tokens-run-target", {
     "package.json": JSON.stringify({ name: "t" }),
   });
@@ -639,11 +646,11 @@ async function suiteTokens() {
     run({ cwd: target, flags: { role: "generator", task: "test task", provider: "echo" } })
   );
   const lastEntry = JSON.parse(
-    fs.readFileSync(path.join(target, ".agent/memory/decisions.jsonl"), "utf8")
+    fs.readFileSync(path.join(target, ".agent/memory/runs.jsonl"), "utf8")
       .trim().split("\n").filter(Boolean).pop()
   );
-  assert("tokens: decisions.jsonl entry includes tokens.used", typeof lastEntry.tokens?.used === "number", lastEntry);
-  assert("tokens: decisions.jsonl entry includes tokens.pct", typeof lastEntry.tokens?.pct === "number", lastEntry);
+  assert("tokens: runs.jsonl entry includes tokens.used", typeof lastEntry.tokens?.used === "number", lastEntry);
+  assert("tokens: runs.jsonl entry includes tokens.pct", typeof lastEntry.tokens?.pct === "number", lastEntry);
 
   // handoff file is created when usage exceeds HANDOFF_THRESHOLD
   // Simulate by calling handoffNote and writing manually (avoids mocking MODEL_LIMITS)
@@ -902,7 +909,7 @@ async function suiteHooks() {
   fs.writeFileSync(path.join(sessionDir, "active-role.txt"), "tester\n");
   const agentInfraCode = runScriptWithInput(
     scopeCheck, [],
-    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/memory/decisions.jsonl"), content: "x" } })
+    JSON.stringify({ tool_name: "Write", tool_input: { file_path: path.join(target, ".agent/memory/runs.jsonl"), content: "x" } })
   );
   assert("scope-check: exits 0 for .agent/ infrastructure writes", agentInfraCode === 0, agentInfraCode);
 
@@ -1651,7 +1658,7 @@ async function suiteScopeHardening() {
   }
 
   // Gap 0 regression: writable .agent infra (memory/decisions) still passes
-  const infraCode = runScriptWithInput(scopeCheck, [], writeInput(".agent/memory/decisions.jsonl"));
+  const infraCode = runScriptWithInput(scopeCheck, [], writeInput(".agent/memory/runs.jsonl"));
   assert("scope-check: still ALLOWS writable .agent/ infra (.agent/memory)", infraCode === 0, infraCode);
 
   // --- Gap 3: empty-scope role is fail-closed (read-only) ---
@@ -2273,6 +2280,151 @@ async function suiteLayout() {
   assert("hooks: the shared settings.json is left untouched", fs.readFileSync(settings, "utf8") === shared, null);
 }
 
+// 0.10.0: the run log is runs.jsonl (telemetry); decisions live in docs/decisions/,
+// as ADRs or repo-memory records. Nothing tells an agent to log decisions in a file it
+// can append to, and no gate passes because the agent wrote a word into a log.
+async function suiteDecisions() {
+  process.stdout.write("\n[decisions]\n");
+  const T = require("../lib/util/templates");
+  const { migrateRunLog, isRunEntry } = require("../lib/util/runlog");
+  const { decisionContext } = require("../lib/util/decisions");
+  const runLine = (task) => JSON.stringify({ ts: "2026-10-01T10:00:00.000Z", role: "generator", task, provider: "echo", model: "m", tokens: { used: 1, limit: 10, pct: 10 } });
+
+  assert("runlog: a run entry is recognised", isRunEntry(JSON.parse(runLine("x"))), null);
+  assert("runlog: a free-form decision is not a run entry", !isRunEntry({ ts: "x", decision: "use redis" }), null);
+
+  // Safe migration: every line is a run entry → renamed, archive too.
+  const safe = fixture("dec-migrate-safe", {
+    ".agent/memory/decisions.jsonl": runLine("a") + "\n" + runLine("b") + "\n",
+    ".agent/memory/decisions-archive.jsonl": runLine("old") + "\n",
+  });
+  const m1 = migrateRunLog(safe);
+  assert("runlog: all-run decisions.jsonl is migrated", m1.action === "migrated", m1);
+  assert("runlog: runs.jsonl now holds both entries",
+    fs.readFileSync(path.join(safe, ".agent/memory/runs.jsonl"), "utf8").trim().split("\n").length === 2, null);
+  assert("runlog: the old file is gone", !fs.existsSync(path.join(safe, ".agent/memory/decisions.jsonl")), null);
+  assert("runlog: the archive is renamed too", fs.existsSync(path.join(safe, ".agent/memory/runs-archive.jsonl")), null);
+  assert("runlog: migrating twice is a no-op", migrateRunLog(safe).action === "none", null);
+
+  // Mixed file: a hand-written decision means nothing is touched.
+  const mixedContent = runLine("a") + "\n" + JSON.stringify({ ts: "2026-10-02", decision: "use redis for sessions" }) + "\nnot json\n";
+  const mixed = fixture("dec-migrate-mixed", { ".agent/memory/decisions.jsonl": mixedContent });
+  const m2 = migrateRunLog(mixed);
+  assert("runlog: a file with non-run lines is kept", m2.action === "kept" && /2 lines that are not run entries/.test(m2.detail), m2);
+  assert("runlog: the kept file is byte-identical",
+    fs.readFileSync(path.join(mixed, ".agent/memory/decisions.jsonl"), "utf8") === mixedContent, null);
+  assert("runlog: nothing is created next to a kept file", !fs.existsSync(path.join(mixed, ".agent/memory/runs.jsonl")), null);
+
+  const both = fixture("dec-migrate-both", { ".agent/memory/decisions.jsonl": runLine("a") + "\n", ".agent/memory/runs.jsonl": runLine("b") + "\n" });
+  assert("runlog: with both files present nothing is touched", migrateRunLog(both).action === "both", null);
+  assert("runlog: dry run reports without renaming",
+    migrateRunLog(fixture("dec-dry", { ".agent/memory/decisions.jsonl": runLine("a") + "\n" }), { dryRun: true }).action === "migrated" &&
+    fs.existsSync(path.join(TMP, "dec-dry/.agent/memory/decisions.jsonl")), null);
+
+  // init writes runs.jsonl and an ADR-mode shim when repo-memory is absent.
+  const plain = fixture("dec-init-plain", { "package.json": JSON.stringify({ name: "p" }) });
+  await captureStdout(async () => init({ cwd: plain, flags: {} }));
+  const plainShim = fs.readFileSync(path.join(plain, "AGENTS.md"), "utf8");
+  assert("init: creates runs.jsonl, not decisions.jsonl",
+    fs.existsSync(path.join(plain, ".agent/memory/runs.jsonl")) && !fs.existsSync(path.join(plain, ".agent/memory/decisions.jsonl")), null);
+  assert("init: shim sends decisions to docs/decisions as ADRs", plainShim.includes("Add an ADR as `docs/decisions/NNNN-<title>.md`"), plainShim);
+  assert("init: shim no longer mentions decisions.jsonl", !plainShim.includes("decisions.jsonl"), null);
+  const manifest = fs.readFileSync(path.join(plain, ".agent/manifest.yaml"), "utf8");
+  assert("init: manifest lists runs.jsonl and docs/decisions", manifest.includes("runs.jsonl") && manifest.includes("docs/decisions"), manifest);
+  assert("init: agent README says runs.jsonl is telemetry",
+    fs.readFileSync(path.join(plain, ".agent/README.md"), "utf8").includes("telemetry, not a place for decisions"), null);
+
+  // With repo-memory installed, the shim points agents at repo-memory and its folder.
+  const rm = fixture("dec-init-rm", { "package.json": JSON.stringify({ name: "r" }), "repo-memory.json": JSON.stringify({ version: 1, dir: "adr" }) });
+  assert("decisions: repo-memory is detected from repo-memory.json",
+    JSON.stringify(decisionContext(rm)) === JSON.stringify({ repoMemory: true, decisionsDir: "adr", dirs: ["docs/decisions", "adr"] }), decisionContext(rm));
+  await captureStdout(async () => init({ cwd: rm, flags: {} }));
+  const rmShim = fs.readFileSync(path.join(rm, "CLAUDE.md"), "utf8");
+  assert("init: shim tells agents to propose with repo-memory", rmShim.includes("npx @semeton/repo-memory propose") && rmShim.includes("`adr/`"), rmShim);
+  assert("init: shim tells agents to read repo-memory before changing files", rmShim.includes("npx @semeton/repo-memory for <path>"), null);
+
+  // update: installing repo-memory later re-points an existing shim, and migrates the log.
+  fs.writeFileSync(path.join(plain, "repo-memory.json"), JSON.stringify({ version: 1 }));
+  fs.renameSync(path.join(plain, ".agent/memory/runs.jsonl"), path.join(plain, ".agent/memory/decisions.jsonl"));
+  fs.writeFileSync(path.join(plain, ".agent/memory/decisions.jsonl"), runLine("before upgrade") + "\n");
+  await captureAll(() => update({ cwd: plain, flags: {} }));
+  const updated = fs.readFileSync(path.join(plain, "AGENTS.md"), "utf8");
+  assert("update: shim switches to repo-memory once it is installed", updated.includes("npx @semeton/repo-memory propose") && !updated.includes("Add an ADR"), updated);
+  assert("update: the shim block is replaced, not duplicated", updated.split("<!-- agent-contract:shim -->").length === 2, null);
+  assert("update: migrates a safe decisions.jsonl to runs.jsonl",
+    fs.readFileSync(path.join(plain, ".agent/memory/runs.jsonl"), "utf8").includes("before upgrade"), null);
+
+  // run on a pre-0.10 repo keeps one history file.
+  const legacyRun = fixture("dec-run-legacy", { "package.json": JSON.stringify({ name: "l" }) });
+  await captureStdout(async () => init({ cwd: legacyRun, flags: {} }));
+  fs.rmSync(path.join(legacyRun, ".agent/memory/runs.jsonl"));
+  fs.writeFileSync(path.join(legacyRun, ".agent/memory/decisions.jsonl"), runLine("old run") + "\n");
+  await captureAll(() => run({ cwd: legacyRun, flags: { role: "generator", task: "new run", provider: "echo" } }));
+  const history = fs.readFileSync(path.join(legacyRun, ".agent/memory/runs.jsonl"), "utf8").trim().split("\n");
+  assert("run: a legacy log is migrated, then appended to", history.length === 2 && history[0].includes("old run"), history);
+
+  // status reads the run log and says where decisions live.
+  const { status } = require("../lib/commands/status");
+  let statusOut = "";
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (c) => { statusOut += c; return true; };
+  try { await status({ cwd: legacyRun }); } finally { process.stdout.write = origWrite; }
+  assert("status: shows last runs from runs.jsonl", statusOut.includes("last runs:") && statusOut.includes("new run"), statusOut);
+  assert("status: says where decisions live", statusOut.includes("decisions:    docs/decisions/ (ADRs)"), statusOut);
+  fs.rmSync(path.join(legacyRun, ".agent/memory/runs.jsonl"));
+  fs.writeFileSync(path.join(legacyRun, ".agent/memory/decisions.jsonl"), mixedContent);
+  statusOut = "";
+  process.stdout.write = (c) => { statusOut += c; return true; };
+  try { await status({ cwd: legacyRun }); } finally { process.stdout.write = origWrite; }
+  assert("status: flags hand-written lines in a legacy decisions.jsonl", statusOut.includes("2 lines that are not run entries"), statusOut);
+
+  // post-generate: no gate passes because an agent wrote a word into a log.
+  const postGen = T.postGenerateCheck({ language: "typescript", framework: null, test_runner: null, lint: null, formatter: null, package_manager: "npm" });
+  assert("post-generate: the 'approv' grep is gone", !postGen.includes('grep -qi "approv"'), null);
+  assert("post-generate: the no-op architect gate is gone", !postGen.includes("grep -q '\"task\"'"), null);
+  assert("post-generate: dependency changes still produce a notice", postGen.includes("NOTE — a dependency manifest changed"), null);
+  assert("post-generate: no reference to decisions.jsonl remains", !postGen.includes("decisions.jsonl"), null);
+  assert("write-handoff: reads runs.jsonl, falling back to decisions.jsonl",
+    T.writeHandoffScript().includes('RUNLOG="$MEMORY_DIR/runs.jsonl"') && T.writeHandoffScript().includes('RUNLOG="$MEMORY_DIR/decisions.jsonl"'), null);
+  assert("templates: no emitted file tells agents to log decisions in a jsonl",
+    ![T.shimContent(), T.readmeForAgentDir(), T.prTemplate(), T.handoffTemplate()].some((t) => /decisions\.jsonl/.test(t)), null);
+
+  // check: a repo-memory record in repo-memory's own folder satisfies the gate, and
+  // repo-memory.json itself is a sensitive path.
+  const { check } = require("../lib/commands/check");
+  const gateRepo = fixture("dec-check", { "package.json": JSON.stringify({ name: "g" }), "repo-memory.json": JSON.stringify({ version: 1, dir: "adr" }) });
+  const gsh = (cmd) => execSync(cmd, { cwd: gateRepo, stdio: "pipe" });
+  const gcommit = (msg) => gsh(`git add -A && git -c user.email=t@t -c user.name=t commit -qm ${msg}`);
+  gsh("git init -q -b main");
+  gcommit("init");
+  gsh("git checkout -qb feat");
+  const gate = () => captureAll(() => check({ cwd: gateRepo, flags: { base: "main" } }));
+  fs.writeFileSync(path.join(gateRepo, "package.json"), JSON.stringify({ name: "g", dependencies: { y: "1" } }));
+  gcommit("dep");
+  assert("check: dependency change without a record still FAILS", (await gate()) === 1, null);
+  fs.mkdirSync(path.join(gateRepo, "adr"), { recursive: true });
+  fs.writeFileSync(path.join(gateRepo, "adr/MEM-0001-add-y.md"), "---\nid: MEM-0001\n---\n# Add y\n");
+  gcommit("record");
+  assert("check: a repo-memory record in repo-memory's folder passes", (await gate()) === 0, null);
+  gsh("git checkout -q main && git checkout -qb feat2");
+  fs.writeFileSync(path.join(gateRepo, "repo-memory.json"), JSON.stringify({ version: 1, dir: "elsewhere" }));
+  gcommit("cfg");
+  assert("check: changing repo-memory.json needs a recorded reason", (await gate()) === 1, null);
+
+  // layout: root manifests and repo-memory.json are never "source". In a tiny repo they
+  // used to outvote src/, and the fallback proposed *.json as writable (reaching
+  // package.json at any depth).
+  const { adjustScopes } = require("../lib/detect/layout");
+  const tiny = fixture("dec-layout-tiny", {
+    "package.json": JSON.stringify({ name: "t" }), "repo-memory.json": JSON.stringify({ version: 1 }),
+    "package-lock.json": "{}", "src/index.js": "module.exports = 1;\n",
+  });
+  execSync("git init -q -b main && git add -A", { cwd: tiny, stdio: "pipe" });
+  const tinyScopes = adjustScopes({ src: ["src/**"], test: ["test/**"] }, tiny, { language: "javascript" });
+  assert("layout: manifests and repo-memory.json never widen scopes to *.json",
+    !tinyScopes.src.some((g) => g.includes("json")) && tinyScopes.basis === "framework", tinyScopes);
+}
+
 (async () => {
   process.stdout.write("agent-contract smoke test\n");
   try {
@@ -2297,6 +2449,7 @@ async function suiteLayout() {
     await suiteVersion();
     await suiteLayout();
     await suiteCheck();
+    await suiteDecisions();
   } catch (e) {
     process.stderr.write(`fatal: ${e.message}\n${e.stack}\n`);
     process.exit(2);
