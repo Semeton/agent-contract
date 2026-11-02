@@ -12,7 +12,8 @@ This is the **source code for `agent-contract` itself** — a CLI that installs 
 - `roles/` — one YAML per role (generator, integrator, tester, debugger, documenter), each with scoped permissions
 - `checks/` — executable shell scripts that hard-fail on violations (pre-generate, post-generate, debug-scope)
 - `templates/` — commit, PR, debug-report
-- `memory/decisions.jsonl` — append-only decision log
+- `memory/runs.jsonl` — run log written by `agent-contract run` (telemetry, not decisions; `decisions.jsonl` before 0.10.0)
+- decisions themselves live in `docs/decisions/`: ADRs, or repo-memory records when `repo-memory.json` exists
 
 ## Architecture
 
