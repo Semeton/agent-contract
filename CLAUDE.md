@@ -193,7 +193,7 @@ non-zero to block a write. These rules hold whether or not the prompt mentions t
   `.agent/session/active-role.txt`, `.claude/settings*`. Change those out-of-band: a human edit or `agent-contract update`.
 - **Fix only what was asked** (`refactor_policy: forbidden_unless_explicitly_approved`).
 - **Ask when inputs are ambiguous** — do not fill in defaults.
-- **Log non-trivial decisions** to `.agent/memory/decisions.jsonl`.
+- **Decisions go in `docs/decisions/`, where a human reviews them, not in a log.** Add an ADR as `docs/decisions/NNNN-<title>.md`; `agent-contract check` requires one for sensitive changes.
 
 Available context — read what the task needs, there is no required reading order:
 `.agent/manifest.yaml` (contract index), `.agent/memory/codebase-map.md` (file index),
