@@ -2310,7 +2310,15 @@ async function suiteDecisions() {
   const mixedContent = runLine("a") + "\n" + JSON.stringify({ ts: "2026-10-02", decision: "use redis for sessions" }) + "\nnot json\n";
   const mixed = fixture("dec-migrate-mixed", { ".agent/memory/decisions.jsonl": mixedContent });
   const m2 = migrateRunLog(mixed);
-  assert("runlog: a file with non-run lines is kept", m2.action === "kept" && /2 lines that are not run entries/.test(m2.detail), m2);
+  assert("runlog: a file with non-run lines is kept", m2.action === "kept" && /holds 1 decision an agent logged \(and 1 other line\)/.test(m2.detail), m2);
+  assert("runlog: the kept warning names the exact import command",
+    m2.detail.includes("npx @semeton/repo-memory import .agent/memory/decisions.jsonl"), m2.detail);
+
+  // Run entries from before `tokens` was added still count as runs.
+  const oldRun = JSON.stringify({ ts: "2026-07-01T10:00:00.000Z", role: "generator", task: "old", provider: "echo", model: "m", checks: { pre_generate: "pass" } });
+  assert("runlog: a pre-tokens run entry is still a run entry", isRunEntry(JSON.parse(oldRun)), null);
+  const older = fixture("dec-migrate-older", { ".agent/memory/decisions.jsonl": oldRun + "\n" + runLine("new") + "\n" });
+  assert("runlog: a log of old and new run entries migrates", migrateRunLog(older).action === "migrated", null);
   assert("runlog: the kept file is byte-identical",
     fs.readFileSync(path.join(mixed, ".agent/memory/decisions.jsonl"), "utf8") === mixedContent, null);
   assert("runlog: nothing is created next to a kept file", !fs.existsSync(path.join(mixed, ".agent/memory/runs.jsonl")), null);
@@ -2376,7 +2384,7 @@ async function suiteDecisions() {
   statusOut = "";
   process.stdout.write = (c) => { statusOut += c; return true; };
   try { await status({ cwd: legacyRun }); } finally { process.stdout.write = origWrite; }
-  assert("status: flags hand-written lines in a legacy decisions.jsonl", statusOut.includes("2 lines that are not run entries"), statusOut);
+  assert("status: flags hand-written lines in a legacy decisions.jsonl", statusOut.includes("1 decision an agent logged") && statusOut.includes("repo-memory import"), statusOut);
 
   // post-generate: no gate passes because an agent wrote a word into a log.
   const postGen = T.postGenerateCheck({ language: "typescript", framework: null, test_runner: null, lint: null, formatter: null, package_manager: "npm" });
@@ -2423,6 +2431,20 @@ async function suiteDecisions() {
   const tinyScopes = adjustScopes({ src: ["src/**"], test: ["test/**"] }, tiny, { language: "javascript" });
   assert("layout: manifests and repo-memory.json never widen scopes to *.json",
     !tinyScopes.src.some((g) => g.includes("json")) && tinyScopes.basis === "framework", tinyScopes);
+
+  // update renames the run log before its guards, so a scope refusal can't block it.
+  const refused = fixture("dec-update-refused", { "package.json": JSON.stringify({ name: "r" }), "src/a.js": "1\n" });
+  await captureStdout(async () => init({ cwd: refused, flags: {} }));
+  fs.rmSync(path.join(refused, ".agent/memory/runs.jsonl"));
+  fs.writeFileSync(path.join(refused, ".agent/memory/decisions.jsonl"), runLine("kept history") + "\n");
+  // Narrow a role on disk so the regenerated one counts as a widening and update refuses.
+  const gen = path.join(refused, ".agent/roles/generator.yaml");
+  fs.writeFileSync(gen, fs.readFileSync(gen, "utf8").replace(/  - src\/\*\*\n/g, ""));
+  const refusedCode = await captureAll(() => update({ cwd: refused, flags: {} }));
+  assert("update: refuses the widening (precondition)", refusedCode === 1, refusedCode);
+  assert("update: the run log is renamed even when update refuses on scope",
+    fs.existsSync(path.join(refused, ".agent/memory/runs.jsonl")) &&
+    fs.readFileSync(path.join(refused, ".agent/memory/runs.jsonl"), "utf8").includes("kept history"), null);
 }
 
 (async () => {

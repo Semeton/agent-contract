@@ -48,3 +48,14 @@ for where a decision goes, and one of them had no human in the path.
   actually read, is refreshed by a plain `update`.
 - Installing repo-memory after agent-contract needs one `agent-contract update` to re-point
   the shim.
+
+## Revision (0.10.2)
+
+- A run entry is now `ts` + `role` + `task` plus any one run-only field (`tokens`, `provider`,
+  `model`, `checks`, `output_lines`). `tokens` arrived in a later version, so requiring it
+  made older run logs look hand-written and blocked their migration.
+- `update` migrates the run log before its scope and enforcement guards. The rename is
+  unrelated to roles, and a refusal further down should not leave a repo half-upgraded.
+- When a `decisions.jsonl` is kept, `update` and `status` now print the exact command that
+  turns its entries into reviewable proposals:
+  `npx @semeton/repo-memory import .agent/memory/decisions.jsonl` (repo-memory 0.1.4+).
